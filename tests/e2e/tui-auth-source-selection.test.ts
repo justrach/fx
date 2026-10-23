@@ -539,6 +539,7 @@ function startFakeChatGptOAuth(
   const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const jwk = { ...publicKey.export({ format: "jwk" }), kid: "fx-e2e", alg: "RS256", use: "sig" };
   let authorization: URL | undefined;
+  const authorizationClients: string[] = [];
   function idToken(refresh: boolean) {
     const encode = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
     const unsigned = `${encode({ alg: "RS256", kid: jwk.kid, typ: "JWT" })}.${encode({
@@ -583,8 +584,10 @@ function startFakeChatGptOAuth(
       });
       if (url.pathname === "/.well-known/jwks.json") return Response.json({ keys: [jwk] });
       if (url.pathname === "/api/accounts/authorize") {
-        expect(url.searchParams.get("client_id")).toBe(authorization ? "oaiapp_fx_test" : "dynamic_agent_client");
-        expect(url.searchParams.get("agent_name_hint")).toBe(authorization ? null : "fx");
+        const clientId = url.searchParams.get("client_id") ?? "";
+        expect(["dynamic_agent_client", "oaiapp_fx_test"]).toContain(clientId);
+        expect(url.searchParams.get("agent_name_hint")).toBe(clientId === "dynamic_agent_client" ? "fx" : null);
+        authorizationClients.push(clientId);
         expect(url.searchParams.has("id_token_hint")).toBe(false);
         expect(url.searchParams.get("resource")).toBe("https://api.openai.com/v1");
         expect(url.searchParams.get("scope")?.split(" ")).toContain("chatgpt.tokens.use.direct");
@@ -671,6 +674,7 @@ function startFakeChatGptOAuth(
   return {
     get accessToken() { return accessToken; },
     get hostId() { return authorization?.searchParams.get("ext_agent_host_id"); },
+    authorizationClients,
     requests,
     env: {
       FX_E2E_CHATGPT_ISSUER_URL: baseUrl,
@@ -2640,6 +2644,7 @@ tmuxTest(
     expect(reauthenticated.models.codex).toBe("gpt-5.4-mini");
     expect(chatgptOauth.requests.filter((request) => request.path === "/api/accounts/authorize"))
       .toHaveLength(authorizeRequestsBeforeRoundTrip + 1);
+    expect(chatgptOauth.authorizationClients).toEqual(["dynamic_agent_client", "dynamic_agent_client"]);
     await session.sendKeys("C-c");
 
     expect(session.isAlive()).toBe(true);
@@ -4208,6 +4213,7 @@ test(
     const returningLogin = await runCodexLoginWithBrowser(env);
     expect(returningLogin.code, `stdout: ${returningLogin.stdout}\nstderr: ${returningLogin.stderr}`).toBe(0);
     const returningStored = JSON.parse(readFileSync(authPath, "utf8"));
+    expect(chatgptOauth.authorizationClients).toEqual(["dynamic_agent_client", "oaiapp_fx_test"]);
     expect(returningStored.client_id).toBe(stored.client_id);
     expect(returningStored.host_id).toBe(stored.host_id);
 
@@ -4242,6 +4248,7 @@ test("ChatGPT returning sign-in preserves credentials when the signed subject ch
   expect(returning.code).not.toBe(0);
   expect(returning.stdout).not.toContain("Signed in with Codex.");
   expect(readFileSync(authPath, "utf8")).toBe(original);
+  expect(chatgptOauth.authorizationClients).toEqual(["dynamic_agent_client", "oaiapp_fx_test"]);
   expect(chatgptOauth.requests.filter((request) => request.path === "/.well-known/jwks.json"))
     .toHaveLength(1);
   expect(chatgptOauth.requests.filter((request) => request.path.startsWith("/chatgpt/")))
@@ -6100,7 +6107,7 @@ test(
     const login = await runCodexLoginWithBrowser(env);
     expect(login.code).toBe(1);
     expect(login.stdout).not.toContain("Signed in with Codex.");
-    expect(login.stderr).toContain("fx login: could not load the target model catalog (malformed_response)");
+    expect(login.stderr).toContain("fx login: target model catalog is empty");
     expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(true);
     const settingsPath = join(home, ".fx", "settings.json");
     expect(existsSync(settingsPath)).toBe(false);
