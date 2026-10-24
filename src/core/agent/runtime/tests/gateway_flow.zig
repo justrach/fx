@@ -1809,6 +1809,52 @@ test "processQueuedPrompt rereads historical authorized image through optional V
     try std.testing.expectEqualStrings("Final selected-model answer", hooks.finish_assistant_text.?);
 }
 
+test "processQueuedPrompt sends a text-only turn while a down catalog withholds an earlier image" {
+    // The reported session: a screenshot from an earlier turn, then a
+    // text-only turn after a restart, while the model catalog is unreachable.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const image_path = try writeTestImagePath(alloc, &tmp);
+    defer alloc.free(image_path);
+    const history_image = try testCapturedImage(alloc, &tmp, image_path, 1);
+    defer types.freeImageAttachment(alloc, history_image);
+    var history_images = [_]types.ImageAttachment{history_image};
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{
+            .text = @constCast("Is this redirect right? [Image #1]"),
+            .images = &history_images,
+        },
+        .assistant = @constCast("It is the local callback."),
+    } }};
+    const completions = [_]FakeCompletion{.{ .content = "Here is the preview." }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.catalog_unavailable = true;
+    hooks.default_model_capabilities = .{ .image_input_support = .unknown, .context_window = 1_000_000 };
+    hooks.tool_registry = .{ .tools = test_support.vision_agent_test_tools[0..] };
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.prompt = @constCast("Testing");
+    job.history = history[0..];
+    job.authorized_image_catalog = &history_images;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 0, "\"type\":\"file\"");
+    try expectBodyNotContains(&gateway, 0, "\"name\":\"vision\"");
+    try expectBodyContains(&gateway, 0, "[Image #1 was not sent with this request: fx could not confirm image input support");
+    try std.testing.expectEqualStrings("Here is the preview.", hooks.finish_assistant_text.?);
+    var notices: usize = 0;
+    for (hooks.texts.items) |text| {
+        if (std.mem.find(u8, text, "Earlier images aren't reaching the model right now") != null) notices += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), notices);
+}
+
 test "processQueuedPrompt keeps required Vision gate cancellation neutral" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

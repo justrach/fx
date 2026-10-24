@@ -293,11 +293,10 @@ test.skipIf(!tmuxAvailable())(
     expect(sessionId.length).toBeGreaterThan(0);
     expect(gateway.requests).toHaveLength(3);
     const schema = schemaFromRequest(gateway.requests[0]!.body);
-    const request = (schema.properties as Record<string, any>).request;
-    const actions = request.oneOf.map(
-      (branch: any) => branch.properties.action.enum[0],
-    );
-    expect(actions).toEqual(["run", "run", "interact", "stop"]);
+    const properties = schema.properties as Record<string, any>;
+    expect(properties.request).toBeUndefined();
+    expect(schema.required).toEqual(["action"]);
+    expect(properties.action.enum).toEqual(["run", "interact", "stop"]);
     expect(gateway.requests[0]!.body).not.toContain('"name":"terminal"');
     const runResult = toolResultEnvelope(
       gateway.requests[1]!.body,

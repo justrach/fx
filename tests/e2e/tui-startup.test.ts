@@ -274,13 +274,13 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         expect(initial.split(banner)).toHaveLength(2);
 
         for (const command of ["/clear", "/reset", "/new"]) {
-          await session.sendText("/status");
-          await session.waitForText("model=", 5_000);
+          await session.sendText("/allowlist");
+          await session.waitForText("* allowlist: effective", 5_000);
           await session.sendText(command);
           const pane = await session.waitForPane(
             (value) =>
               value.includes(banner) &&
-              !value.includes("model=") &&
+              !value.includes("* allowlist:") &&
               hasEmptyComposer(value),
             5_000,
           );
@@ -334,24 +334,24 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         });
         await session.waitForComposer(10_000);
         for (let i = 0; i < 8; i++) {
-          await session.sendText("/status");
+          await session.sendText("/allowlist");
           await session.waitForComposer(5_000);
         }
         const before = await session.captureFullScrollback();
-        const lastStatus = before.slice(before.lastIndexOf("* status:"));
-        expect(lastStatus).toContain("agent_step_limit=0");
+        const lastNotice = before.slice(before.lastIndexOf("* allowlist:"));
+        expect(lastNotice).toContain("* allowlist: effective persistent allow rules: (none)");
 
         await session.sendText("/new");
         await session.waitForPane(
-          (pane) => pane.includes(banner) && !pane.includes("model=") && hasEmptyComposer(pane),
+          (pane) => pane.includes(banner) && !pane.includes("* allowlist:") && hasEmptyComposer(pane),
           5_000,
         );
         const after = await session.captureFullScrollback();
-        const priorStatus = after.slice(after.lastIndexOf("* status:"), after.lastIndexOf(banner)).trimEnd();
-        expect(priorStatus).toBe(lastStatus.split("\n┃")[0]?.trimEnd());
-        expect(priorStatus).not.toContain("Commands 1");
-        expect(priorStatus).not.toContain("run /login ·");
-        expect(await session.capturePane()).not.toContain("model=");
+        const priorNotice = after.slice(after.lastIndexOf("* allowlist:"), after.lastIndexOf(banner)).trimEnd();
+        expect(priorNotice).toBe(lastNotice.split("\n┃")[0]?.trimEnd());
+        expect(priorNotice).not.toContain("Commands 1");
+        expect(priorNotice).not.toContain("run /login ·");
+        expect(await session.capturePane()).not.toContain("* allowlist:");
         const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], { encoding: "utf8" }));
         expect(replay.frame_count).toBeGreaterThan(0);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -449,34 +449,41 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           height: 18,
         });
         await session.waitForComposer(10_000);
-        await session.sendText("/status");
-        await session.waitForPane((pane) => pane.includes("agent_step_limit=0"), 5_000);
+        // Three local notices, one after another.
+        for (const view of ["effective", "local", "user"]) {
+          await session.sendText(`/allowlist view ${view}`);
+          await session.waitForPane((pane) => pane.includes(`* allowlist: ${view} persistent allow rules`), 5_000);
+        }
         const before = await session.captureFullScrollback();
-        const expectedStatus = before.slice(before.lastIndexOf("* status:")).split("\n┃")[0]?.trimEnd();
-        expect(expectedStatus).toContain("agent_step_limit=0");
+        const expectedNotice = before.slice(before.lastIndexOf("* allowlist: effective")).split("\n┃")[0]?.trimEnd();
+        expect(expectedNotice).toContain("* allowlist: user persistent allow rules: (none)");
         session.sendLiteralImmediate("/new");
         await session.resizeWindow(78, 18, 0);
         await Bun.sleep(40);
         session.sendKeysImmediate(["Enter"]);
 
         await session.waitForPane(
-          (pane) => pane.includes(banner) && !pane.includes("model=") && hasEmptyComposer(pane),
+          (pane) => pane.includes(banner) && !pane.includes("* allowlist:") && hasEmptyComposer(pane),
           10_000,
         );
         const history = await session.captureFullScrollback();
-        const oldStatus = history.slice(history.lastIndexOf("* status:"), history.lastIndexOf(banner));
+        const oldNotice = history.slice(history.lastIndexOf("* allowlist: effective"), history.lastIndexOf(banner));
         let lastIndex = -1;
-        for (const field of ["* status:", "permission_mode=auto", "workspace=", "history_turns=0", "session_permission_grants=0", "agent_step_limit=0"]) {
-          const index = oldStatus.indexOf(field);
+        for (const field of [
+          "* allowlist: effective persistent allow rules: (none)",
+          "* allowlist: local persistent allow rules: (none)",
+          "* allowlist: user persistent allow rules: (none)",
+        ]) {
+          const index = oldNotice.indexOf(field);
           expect(index).toBeGreaterThan(lastIndex);
           lastIndex = index;
         }
-        expect(oldStatus.replace(/\s+/g, "")).toBe(expectedStatus?.replace(/\s+/g, ""));
-        expect(oldStatus).not.toContain("Commands 1");
-        expect(oldStatus).not.toContain("run /login ·");
+        expect(oldNotice.replace(/\s+/g, "")).toBe(expectedNotice?.replace(/\s+/g, ""));
+        expect(oldNotice).not.toContain("Commands 1");
+        expect(oldNotice).not.toContain("run /login ·");
         expect(session.isAlive()).toBe(true);
-        await session.sendText("/status");
-        await session.waitForPane((pane) => pane.includes("agent_step_limit=0") && hasEmptyComposer(pane), 5_000);
+        await session.sendText("/allowlist");
+        await session.waitForPane((pane) => pane.includes("* allowlist: effective persistent allow rules") && hasEmptyComposer(pane), 5_000);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], { encoding: "utf8" }));
         expect(replay.frame_count).toBeGreaterThan(0);
@@ -510,8 +517,8 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           height: 18,
         });
         await session.waitForComposer(10_000);
-        await session.sendText("/status");
-        await session.waitForText("agent_step_limit=0", 5_000);
+        await session.sendText("/allowlist");
+        await session.waitForText("* allowlist: effective persistent allow rules", 5_000);
         session.sendLiteralImmediate("/new");
         await session.resizeWindow(78, 3, 0);
         session.sendKeysImmediate(["Enter"]);
@@ -609,7 +616,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
       const home = join(root, "home");
       const store = join(home, ".fx", "mcp-credentials");
       mkdirSync(store, { recursive: true, mode: 0o700 });
-      const lock = join(store, "credentials.lock");
+      const lock = join(store, "credentials-v3.lock");
       writeFileSync(lock, "", { mode: 0o600 });
       writeFileSync(
         join(home, ".fx", "mcp.json"),
@@ -643,6 +650,59 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
         expect(firstFrame).toBeGreaterThan(-1);
         // The first frame is drawn while the saved logins are still being read.
         expect(firstFrame).toBeLessThan(gaveUp);
+      } finally {
+        holder.kill();
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  // Before, the menu waited for the saved logins on the UI thread, so /mcp
+  // right after launch froze the shell until they were read.
+  test(
+    "with the MCP sign-in store busy, /mcp opens before the saved logins are read",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-mcp-menu-busy-")));
+      const home = join(root, "home");
+      const store = join(home, ".fx", "mcp-credentials");
+      mkdirSync(store, { recursive: true, mode: 0o700 });
+      const lock = join(store, "credentials-v3.lock");
+      writeFileSync(lock, "", { mode: 0o600 });
+      writeFileSync(
+        join(home, ".fx", "mcp.json"),
+        JSON.stringify({ mcp: { remote: { type: "http", url: "http://127.0.0.1:9/mcp", enabled: true } } }),
+      );
+      const tracePath = join(root, "trace.log");
+      const loaded = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "").includes("MCP credentials not loaded");
+      // Another fx holds the store's lock: reading the saved logins waits 2 s for it.
+      const holder = Bun.spawn(
+        ["perl", "-e", 'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; $| = 1; print "held\n"; sleep $ARGV[1];', lock, "20"],
+        { stdout: "pipe" },
+      );
+      try {
+        const { value } = await holder.stdout.getReader().read();
+        expect(new TextDecoder().decode(value)).toBe("held\n");
+        session = await TmuxSession.create({
+          cwd: root,
+          env: { HOME: home, FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1", FX_TRACE_LOG: tracePath },
+        });
+        await session.waitForComposer(10_000);
+        expect(loaded()).toBe(false);
+        await session.sendText("/mcp");
+        await session.waitForText("MCP servers  1", 5_000);
+        // Still being read when the menu shows.
+        expect(loaded()).toBe(false);
+        // Once they're read, the menu goes on working.
+        const deadline = Date.now() + 10_000;
+        while (!loaded() && Date.now() < deadline) await Bun.sleep(50);
+        expect(loaded()).toBe(true);
+        await session.sendKeys("Enter");
+        await session.waitForText("› Remove        /mcp remove remote", 5_000);
       } finally {
         holder.kill();
         if (session) {

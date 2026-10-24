@@ -166,6 +166,8 @@ Security is permission-first. All sensitive tool behavior must integrate with `s
 
 * Host-generated review holds retain their advice for the agent and transcript, but carry a saved `review_feedback` marker that excludes them from later security evidence, including after recovery. Old unmarked results remain untrusted evidence; never infer the marker from output text. Quoted review accusations are not proof of an attack, and handling plans or test instructions as data is not itself prompt injection
 
+* A command form that fx runs without review, through `command_effect.plan` or `command_effect.knownReversibleAutoCommand`, must be listed in `parity_review_free_commands` in `src/core/shell_command/command_effect.zig`. The shell parity tests check that sh, dash, bash, and zsh, with and without `extendedglob`, run each one exactly as fx parsed it, and the nightly `shell_parity` fuzz target checks generated commands the same way
+
 Do not bypass the permission system for new tools.
 
 ## Zig-Specific Patterns
@@ -243,6 +245,8 @@ fx does not use declarations that Zig 0.17 deprecates. They still compile, so ch
 * Run the narrowest relevant tests while developing. The complete `zig build test` suite runs in ReleaseSafe in **CI** after the feature branch is pushed, and it must pass before the draft PR is marked ready.
 
 * In test blocks, use `std.testing.io` for the `Io` parameter. `io_mod.getIo()` automatically returns `std.testing.io` in test builds.
+
+* A new `std.testing.fuzz` test needs an entry in `tests/fuzz/targets.json` and its saved inputs passed as its corpus, as **Fuzz a parser** in `CONTRIBUTING.md` describes. The nightly Fuzz workflow fuzzes every entry.
 
 * Use `io_mod.dirRealpathAlloc(alloc, dir, sub_path)` to resolve paths within `std.testing.tmpDir()`.
 

@@ -4437,7 +4437,7 @@ describe("acp: model-independent", () => {
         expect(metadataRequests).toBe(0);
         const credentials = join(root.home, ".fx", "mcp-credentials");
         const saved = existsSync(credentials)
-          ? readdirSync(credentials).filter((entry) => entry !== "credentials.lock")
+          ? readdirSync(credentials).filter((entry) => entry !== "credentials-v3.lock")
           : [];
         expect(saved).toEqual([]);
         expect(client.stderr).toBe("");

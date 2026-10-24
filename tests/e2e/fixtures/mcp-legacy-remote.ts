@@ -26,6 +26,7 @@ type StreamableMode =
   | "mixed_delimiters"
   | "unsafe_resume_id"
   | "resume"
+  | "oversized_resumable"
   | "poll"
   | "hold_open_call"
   | "hold_initialize"
@@ -247,6 +248,11 @@ export function startLegacyStreamableHttpFixture(
             }),
             { headers: { "content-type": "text/event-stream" } },
           );
+        }
+        // Resuming the oversized answer's stream gets the same answer again.
+        if (mode === "oversized_resumable") {
+          if (headers["last-event-id"] === undefined) return new Response(null, { status: 405 });
+          return sseResponse([{ id: "call-event-2", data: oversizedCallResponse(resumableCallId!) }]);
         }
         return sseResponse([
           {
@@ -581,6 +587,22 @@ export function startLegacyStreamableHttpFixture(
                 },
               },
             },
+          ]);
+        }
+        // An event id first, so the stream could be resumed, then an answer
+        // over fx's 16 MiB message limit.
+        if (mode === "oversized_resumable") {
+          resumableCallId = message!.id;
+          return sseResponse([
+            {
+              id: "call-event-1",
+              data: {
+                jsonrpc: "2.0",
+                method: "notifications/progress",
+                params: { progressToken: message!.id, progress: 1, total: 2 },
+              },
+            },
+            { id: "call-event-2", data: oversizedCallResponse(message!.id!) },
           ]);
         }
         if (mode === "poll") {
@@ -945,6 +967,11 @@ function toolCallResponse(id: number, text: string) {
       }],
     },
   };
+}
+
+/** A tools/call answer over fx's 16 MiB message limit. */
+function oversizedCallResponse(id: number) {
+  return toolCallResponse(id, "x".repeat(17 * 1024 * 1024));
 }
 
 function sseResponse(

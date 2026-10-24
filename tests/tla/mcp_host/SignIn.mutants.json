@@ -25,10 +25,16 @@
     "invariant": "NoListenerWithoutHost"
   },
   {
-    "description": "A second login doesn't end the first (startLogin without endLogin)",
-    "old": "       IN /\\ phase' = [(IF old # 0 THEN Ended(old) ELSE phase) EXCEPT ![k] = \"open\"]",
-    "new": "       IN /\\ phase' = [phase EXCEPT ![k] = \"open\"]",
+    "description": "A second login while one is under way starts another beside it",
+    "old": "    /\\ ~SigningIn(cur)\n",
+    "new": "",
     "invariant": "OneSignInPerHost"
+  },
+  {
+    "description": "A second login ends the one under way and starts its own, which the engine ignores (startLogin before it reused the login)",
+    "old": "    /\\ ~SigningIn(cur)\n    /\\ LET k == next\n       IN /\\ phase' = [phase EXCEPT ![k] = \"open\"]",
+    "new": "    /\\ LET k == next\n       IN /\\ phase' = [(IF live[cur] # 0 THEN Ended(live[cur]) ELSE phase) EXCEPT ![k] = \"open\"]",
+    "invariant": "FlowHasListener"
   },
   {
     "description": "A login the browser never comes back to never expires",
@@ -44,8 +50,8 @@
   },
   {
     "description": "A new host starts a sign-in while an old one still signs in",
-    "old": "    /\\ \\A h \\in Hosts : alive[h] => h = cur\n",
-    "new": "",
+    "old": "    /\\ \\A h \\in Hosts : alive[h] => h = cur\n    /\\ ~SigningIn(cur)\n",
+    "new": "    /\\ ~SigningIn(cur)\n",
     "invariant": "OneSignInPerServer"
   },
   {

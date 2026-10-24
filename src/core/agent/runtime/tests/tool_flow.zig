@@ -440,6 +440,12 @@ const FreshnessApplicableContext = struct {
 };
 
 fn expectPermissionDeniedToolResult(gateway: *const FakeGateway, index: usize, tool_name: []const u8, reason: types.ToolPermissionDenialReason) !void {
+    return expectPermissionDeniedToolResultAs(gateway, index, tool_name, tool_name, reason);
+}
+
+/// `history_tool_name` is the result's tool in the replayed request, which can
+/// differ from the denied tool when legacy history is projected onto shell.
+fn expectPermissionDeniedToolResultAs(gateway: *const FakeGateway, index: usize, history_tool_name: []const u8, tool_name: []const u8, reason: types.ToolPermissionDenialReason) !void {
     const alloc = std.testing.allocator;
     try std.testing.expect(index < gateway.request_bodies.items.len);
 
@@ -456,7 +462,7 @@ fn expectPermissionDeniedToolResult(gateway: *const FakeGateway, index: usize, t
         for (content.array.items) |part| {
             if (part != .object) continue;
             const part_tool_name = part.object.get("toolName") orelse continue;
-            if (part_tool_name != .string or !std.mem.eql(u8, part_tool_name.string, tool_name)) continue;
+            if (part_tool_name != .string or !std.mem.eql(u8, part_tool_name.string, history_tool_name)) continue;
             const output = part.object.get("output") orelse continue;
             if (output != .object) continue;
             const output_type = output.object.get("type") orelse continue;
@@ -4465,7 +4471,8 @@ test "processQueuedPrompt denied registered run command compatibility never reac
     try std.testing.expectEqual(@as(usize, 1), hooks.permission_names.items.len);
     try std.testing.expectEqualStrings("terminal", hooks.permission_names.items[0]);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try expectPermissionDeniedToolResult(&gateway, 1, "terminal", .user_denied);
+    // History replays the legacy exec as the shell run it maps to.
+    try expectPermissionDeniedToolResultAs(&gateway, 1, "shell", "terminal", .user_denied);
 }
 
 test "processQueuedPrompt legacy auto denial retains lifecycle source" {

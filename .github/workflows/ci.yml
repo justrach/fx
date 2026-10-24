@@ -56,7 +56,7 @@ jobs:
         run: ./scripts/check-indexer-boundary.sh
 
       - name: Test CI and release scripts
-        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need -q
+        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_fuzz_nightly -q
 
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
@@ -64,7 +64,9 @@ jobs:
       # The zsh user profile tests in src/core/execution/command_runner.zig
       # skip without /bin/zsh. They start interactive zsh with no terminal,
       # where Ubuntu's global zshrc runs compinit, and on this runner compinit
-      # aborts and writes an error to stderr, so the job turns it off.
+      # aborts and writes an error to stderr, so the job turns it off. The
+      # shell parity tests in src/core/shell_command/command_effect.zig use
+      # zsh too.
       - name: Install zsh
         run: |
           command -v zsh >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zsh; }
@@ -73,6 +75,9 @@ jobs:
       - name: Test
         env:
           TEST_TIMEOUT_SECONDS: ${{ matrix.test_timeout_seconds }}
+          # Ubuntu has sh, dash, and bash, and the step above adds zsh, so the
+          # shell parity tests fail here if any of them is missing.
+          FX_SHELL_PARITY_ALL_SHELLS: "1"
         run: |
           started_at=$SECONDS
           trap 'printf "Unit tests elapsed: %ss\n" "$((SECONDS - started_at))"' EXIT

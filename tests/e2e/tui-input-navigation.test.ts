@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { closeStatusPanel, waitForStatusPanel } from "./info-panel";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -1326,10 +1327,9 @@ tmuxTest(
 
     await typeLiteral(active, "/status");
     await active.sendKeys("Enter");
-    await active.waitForPane(
-      (pane) => pane.includes("model=") && pane.includes("[Image 1]"),
-      READY_TIMEOUT,
-    );
+    await waitForStatusPanel(active, READY_TIMEOUT);
+    await closeStatusPanel(active, READY_TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("[Image 1]"), READY_TIMEOUT);
 
     expect(gateway?.requests).toHaveLength(0);
     const composer = (await active.capturePaneGrid())

@@ -8,6 +8,8 @@
 \* same here), an HTTP failure with no JSON-RPC body, or a stream that
 \* breaks first. A broken stream is re-issued with a new id, but a tools/call
 \* is never re-sent by the transport: it ends lost, flagged as maybe run.
+\* An answer over the message limit ends the request lost at once, never
+\* re-issued, as another attempt would bring the same answer (HTTP-14).
 \* A -32020 to a tools/call means re-listing the tools and retrying once.
 \* Cancelling closes the stream; HTTP has no notifications/cancelled (HTTP-08).
 \* An answer closes its attempt's stream too: the final response ends it, and
@@ -110,6 +112,15 @@ StreamBroken ==
                /\ UNCHANGED <<attempts, currentId, nextId, closed, usedIds, reused>>
     /\ UNCHANGED <<kind, headerRetries, cancelNote>>
 
+\* The answer was over the message limit: lost at once, never re-issued, as
+\* another attempt would bring the same answer (HTTP-14). A call may have run.
+TooLarge ==
+    /\ phase = "posted"
+    /\ phase' = "lost"
+    /\ maybeRan' = (kind = "call")
+    /\ Deliver("lost")
+    /\ UNCHANGED <<kind, attempts, headerRetries, currentId, nextId, closed, usedIds, reused, cancelNote>>
+
 \* The re-list after -32020 ended: retry the call once, or give up.
 Relisted(ok) ==
     /\ phase = "relisting"
@@ -135,6 +146,7 @@ Environment ==
     \/ \E a \in {"result", "error", "mismatch"} : Answer(a)
     \/ HttpFailure
     \/ StreamBroken
+    \/ TooLarge
     \/ \E ok \in BOOLEAN : Relisted(ok)
 
 Next == Send \/ Environment \/ Cancel
@@ -167,6 +179,10 @@ CancelByClose == (phase = "cancelled" => closed) /\ ~cancelNote
 
 \* An answered attempt holds no stream, even one the server left open (HTTP-13).
 AnsweredStreamClosed == phase \in {"done", "relisting"} => closed
+
+\* HTTP-14: an answer over the message limit ends the request, lost, and
+\* nothing asks for it again. An action property, so it adds no state.
+TooLargeEnds == [][TooLarge => phase' = "lost"]_vars
 
 \* Every request ends.
 EveryRequestEnds == phase \in {"posted", "relisting"} ~> phase \in Terminal

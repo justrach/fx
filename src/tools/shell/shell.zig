@@ -91,6 +91,82 @@ pub fn actionFieldContract(action: Action) ActionFieldContract {
     };
 }
 
+/// Names the action of a call that omits `action` when exactly one action
+/// takes every field it sends and gets every field it requires. Fields that
+/// decode treats as absent, null or the text "null", are ignored. A bare
+/// session_id fits both interact and stop, so it names neither. The
+/// orchestrator adds the result before the call is stored or admitted, so
+/// permission admission and decode read the same arguments
+/// (`tests/tla/shell_command/ShellContract.tla` AdmissionConsistency).
+pub fn inferAction(object: std.json.ObjectMap) ?[]const u8 {
+    if (object.get("action") != null) return null;
+    var found: ?Action = null;
+    for (std.enums.values(Action)) |action| {
+        if (!fieldsFitAction(object, actionFieldContract(action))) continue;
+        if (found != null) return null;
+        found = action;
+    }
+    return if (found) |action| @tagName(action) else null;
+}
+
+fn fieldsFitAction(object: std.json.ObjectMap, contract: ActionFieldContract) bool {
+    var fields = object.iterator();
+    while (fields.next()) |entry| {
+        if (isAbsentValue(entry.value_ptr.*)) continue;
+        if (!containsFieldName(contract.allowed, entry.key_ptr.*)) return false;
+    }
+    for (contract.required) |name| {
+        if (std.mem.eql(u8, name, "action")) continue;
+        const value = object.get(name) orelse return false;
+        if (isAbsentValue(value)) return false;
+    }
+    return true;
+}
+
+fn isAbsentValue(value: std.json.Value) bool {
+    return value == .null or
+        (value == .string and tool_args.isNullPlaceholderText(value.string));
+}
+
+fn containsFieldName(names: []const []const u8, name: []const u8) bool {
+    for (names) |candidate| {
+        if (std.mem.eql(u8, candidate, name)) return true;
+    }
+    return false;
+}
+
+test "inferAction names the one action a call's fields fit" {
+    const cases = [_]struct { args: []const u8, action: ?[]const u8 }{
+        .{ .args = "{\"command\":\"git status\"}", .action = "run" },
+        .{ .args = "{\"command\":\"make\",\"cwd\":\"src\",\"yield_time_ms\":30000,\"timeout_ms\":600000}", .action = "run" },
+        .{ .args = "{\"command\":\"python3\",\"tty\":true,\"session_id\":null,\"chars\":\"null\"}", .action = "run" },
+        .{ .args = "{\"session_id\":\"shell-1\",\"chars\":\"y\\n\"}", .action = "interact" },
+        .{ .args = "{\"session_id\":\"shell-1\",\"yield_time_ms\":5000}", .action = "interact" },
+        .{ .args = "{\"session_id\":\"shell-1\",\"force\":true}", .action = "stop" },
+        // A bare session_id could observe or stop the session.
+        .{ .args = "{\"session_id\":\"shell-1\"}", .action = null },
+        // A command beside a session could start one or write to one.
+        .{ .args = "{\"command\":\"ls\",\"session_id\":\"shell-1\"}", .action = null },
+        .{ .args = "{\"command\":\"ls\",\"force\":true}", .action = null },
+        .{ .args = "{\"command\":\"ls\",\"note\":\"why\"}", .action = null },
+        .{ .args = "{\"command\":null}", .action = null },
+        .{ .args = "{}", .action = null },
+        .{ .args = "{\"action\":\"run\",\"command\":\"ls\"}", .action = null },
+        .{ .args = "{\"action\":null,\"command\":\"ls\"}", .action = null },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.args, .{});
+        defer parsed.deinit();
+        const inferred = inferAction(parsed.value.object);
+        if (case.action) |expected| {
+            try std.testing.expectEqualStrings(expected, inferred orelse return error.TestExpectedEqual);
+        } else if (inferred) |unexpected| {
+            std.debug.print("{s} inferred {s}\n", .{ case.args, unexpected });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 const OwnedInput = struct {
     arena_state: std.heap.ArenaAllocator.State,
     value: Input,
@@ -191,43 +267,43 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
     defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     if (args_json.len > 16 * 1024) {
-        return correction_json(alloc, &.{"Request is too large to suggest a repair; submit the intended action with only its required fields."}, null);
+        return correction_json(alloc, &.{"Arguments are too large to suggest a repair; submit the intended action with only its required fields."}, null);
     }
     const raw = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return correction_json(alloc, &.{"Shell arguments must be a JSON object."}, null),
     };
     if (raw != .object or raw.object.count() > 32) {
-        return correction_json(alloc, &.{"Shell arguments must be one bounded request object."}, null);
+        return correction_json(alloc, &.{"Shell arguments must be one bounded object."}, null);
     }
 
     var problems: std.ArrayList([]const u8) = .empty;
     var repairable = true;
     var object = raw.object;
+    // Outside a required vision step the orchestrator unwraps an exact
+    // {"request":{...}} before decode, so a wrapper here usually has extra
+    // top-level fields or a string body. Either way, suggest the flat call.
     if (raw.object.get("request")) |wrapper| {
+        try problems.append(arena, "Put the action fields at the top level; shell takes no request wrapper.");
         var request = wrapper;
         if (request == .string) {
-            try problems.append(arena, "request must be an object, not a JSON string.");
             request = std.json.parseFromSliceLeaky(std.json.Value, arena, request.string, .{}) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return correction_json(alloc, problems.items, null),
             };
         }
         if (request != .object or request.object.count() > 32) {
-            return correction_json(alloc, &.{"request must be one object containing the intended action."}, null);
+            return correction_json(alloc, problems.items, null);
         }
         object = request.object;
-        if (raw.object.count() > 1) {
-            try problems.append(arena, "Only request is allowed at the top level; put action fields inside request.");
-            var outer = raw.object.iterator();
-            while (outer.next()) |entry| {
-                const name = entry.key_ptr.*;
-                if (std.mem.eql(u8, name, "request")) continue;
-                if (object.contains(name)) {
-                    repairable = false;
-                } else {
-                    try object.put(arena, name, entry.value_ptr.*);
-                }
+        var outer = raw.object.iterator();
+        while (outer.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (std.mem.eql(u8, name, "request")) continue;
+            if (object.contains(name)) {
+                repairable = false;
+            } else {
+                try object.put(arena, name, entry.value_ptr.*);
             }
         }
     }
@@ -237,10 +313,10 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
         if (value == .string) {
             if (std.meta.stringToEnum(Action, value.string)) |action| break :blk action;
         }
-        try problems.append(arena, "request.action must be run, interact, or stop.");
+        try problems.append(arena, "action must be run, interact, or stop; put the shell command in command.");
         return correction_json(alloc, problems.items, null);
     } else blk: {
-        try problems.append(arena, "request.action is required.");
+        try problems.append(arena, "action is required.");
         const command = object.get("command") orelse return correction_json(alloc, problems.items, null);
         if (command != .string or object.contains("session_id") or object.contains("chars") or object.contains("force")) {
             return correction_json(alloc, problems.items, null);
@@ -253,7 +329,7 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
     if (try actionFieldCorrection(arena, action, object, &scratch)) |correction| {
         for (correction.invalid_fields) |name| {
             try problems.append(arena, try arena.print(
-                "request.{s} is not accepted for {s}.",
+                "{s} is not accepted for {s}.",
                 .{ text_utils.utf8PrefixByBytes(name, 64), @tagName(action) },
             ));
             // A non-null unknown field can express intent that cannot be reconstructed.
@@ -261,11 +337,11 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
             _ = object.orderedRemove(name);
         }
         for (correction.missing_fields) |name| {
-            try problems.append(arena, try arena.print("request.{s} is required.", .{name}));
+            try problems.append(arena, try arena.print("{s} is required for {s}.", .{ name, @tagName(action) }));
             repairable = false;
         }
         for (correction.conflicts) |conflict| {
-            try problems.append(arena, try arena.print("Choose either request.{s} or request.{s}.", .{ conflict[0], conflict[1] }));
+            try problems.append(arena, try arena.print("Choose either {s} or {s}.", .{ conflict[0], conflict[1] }));
             repairable = false;
         }
     }
@@ -286,7 +362,7 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
             var type_reported = false;
             if (comptime @typeInfo(T) == .int) {
                 if (value == .string) {
-                    try problems.append(arena, "request." ++ field_name ++ " must be an integer.");
+                    try problems.append(arena, field_name ++ " must be an integer.");
                     type_reported = true;
                     if (std.fmt.parseInt(T, value.string, 10)) |number| {
                         value = if (std.math.cast(i64, number)) |integer|
@@ -310,7 +386,7 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
                 }
             } else |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
-                if (!type_reported) try problems.append(arena, "request." ++ field_name ++ " must be " ++ expected ++ ".");
+                if (!type_reported) try problems.append(arena, field_name ++ " must be " ++ expected ++ ".");
                 repairable = false;
             }
             try canonical.put(arena, field_name, value);
@@ -329,7 +405,7 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
         repairable = false;
     }
     if (problems.items.len == 0) {
-        try problems.append(arena, "Submit one Shell action inside request.");
+        try problems.append(arena, "Submit one Shell action.");
     }
     return correction_json(alloc, problems.items, if (repairable) canonical else null);
 }
@@ -339,7 +415,6 @@ fn correction_json(
     problems: []const []const u8,
     candidate: ?std.json.ObjectMap,
 ) Allocator.Error![]u8 {
-    const Retry = struct { request: std.json.Value };
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     std.json.Stringify.value(.{ .@"error" = .{
@@ -347,7 +422,7 @@ fn correction_json(
         .executed = false,
         .problems = problems,
         .instruction = if (candidate != null) @as(?[]const u8, "Call shell once using retry_with exactly.") else null,
-        .retry_with = if (candidate) |object| @as(?Retry, .{ .request = .{ .object = object } }) else null,
+        .retry_with = if (candidate) |object| @as(?std.json.Value, .{ .object = object }) else null,
     } }, .{ .emit_null_optional_fields = false }, &out.writer) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
@@ -355,17 +430,17 @@ fn correction_json(
 fn argument_problem(input: Input) ?[]const u8 {
     switch (input.action) {
         .run => {
-            const command = input.command orelse return "request.command is required.";
-            if (command.len == 0 or command.len > terminal_contracts.max_command_bytes) return "request.command must contain 1-65536 bytes.";
-            if (input.timeout_ms == 0) return "request.timeout_ms must be at least 1; choose the intended deadline.";
-            if (input.profile != null and input.shell != null) return "Choose either request.profile or request.shell.";
-            if (!input.tty and input.shell != null) return "request.shell requires tty=true; choose the intended execution mode.";
-            if (input.yield_time_ms > managed_contract.max_yield_time_ms) return "request.yield_time_ms must be between 0 and 30000.";
+            const command = input.command orelse return "command is required for run.";
+            if (command.len == 0 or command.len > terminal_contracts.max_command_bytes) return "command must contain 1-65536 bytes.";
+            if (input.timeout_ms == 0) return "timeout_ms must be at least 1; choose the intended deadline.";
+            if (input.profile != null and input.shell != null) return "Choose either profile or shell.";
+            if (!input.tty and input.shell != null) return "shell applies only with tty=true; remove shell for an ordinary command, or set tty=true for an interactive terminal.";
+            if (input.yield_time_ms > managed_contract.max_yield_time_ms) return "yield_time_ms must be between 0 and 30000 for run.";
         },
         .interact => {
-            if (input.yield_time_ms > managed_contract.max_wait_ceiling_ms) return "request.yield_time_ms must be between 0 and 300000.";
+            if (input.yield_time_ms > managed_contract.max_wait_ceiling_ms) return "yield_time_ms must be between 0 and 300000 for interact.";
             if (input.chars) |chars| {
-                if (chars.len > terminal_contracts.max_write_bytes) return "request.chars exceed 65536 bytes.";
+                if (chars.len > terminal_contracts.max_write_bytes) return "chars exceed 65536 bytes.";
             }
         },
         .stop => {},
@@ -1977,6 +2052,7 @@ test "shell request correction suggests only unambiguous repairs without executi
         .{ .input = "{\"request\":{\"command\":\"sleep 30\"},\"yield_time_ms\":\"30000\"}", .retry = "{\"action\":\"run\",\"command\":\"sleep 30\",\"yield_time_ms\":30000}" },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"background\":null}", .retry = "{\"action\":\"run\",\"command\":\"true\"}" },
         .{ .input = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"true\\\"}\"}", .retry = "{\"action\":\"run\",\"command\":\"true\"}" },
+        .{ .input = "{\"request\":{\"action\":\"run\",\"command\":\"true\"}}", .retry = "{\"action\":\"run\",\"command\":\"true\"}" },
         .{ .input = "{\"action\":\"interact\",\"session_id\":\"shell-3\",\"yield_time_ms\":\"1000\",\"unused\":null}", .retry = "{\"action\":\"interact\",\"yield_time_ms\":1000,\"session_id\":\"shell-3\"}" },
         .{ .input = "{\"command\":\"true\",\"tty\":true}", .retry = null },
         .{ .input = "{}", .retry = null },
@@ -2011,8 +2087,7 @@ test "shell request correction suggests only unambiguous repairs without executi
         try std.testing.expect(detail.get("problems").?.array.items.len > 0);
         try std.testing.expect((try tool_result_errors.inspectTerminalActionFieldCorrection(alloc, failure)) != null);
         if (case.retry) |expected| {
-            const request = detail.get("retry_with").?.object.get("request").?;
-            const json = try std.json.Stringify.valueAlloc(alloc, request, .{});
+            const json = try std.json.Stringify.valueAlloc(alloc, detail.get("retry_with").?, .{});
             defer alloc.free(json);
             try std.testing.expectEqualStrings(expected, json);
             const decoded = try decode(.{ .allocator = alloc }, json);
@@ -2080,8 +2155,8 @@ test "shell request correction bounds feedback and preserves input bytes" {
     defer alloc.free(correction);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, correction, .{});
     defer parsed.deinit();
-    const request = parsed.value.object.get("error").?.object.get("retry_with").?.object.get("request").?.object;
-    try std.testing.expectEqualStrings(command, request.get("command").?.string);
+    const retry = parsed.value.object.get("error").?.object.get("retry_with").?.object;
+    try std.testing.expectEqualStrings(command, retry.get("command").?.string);
 
     const long_key = try alloc.print("{{\"command\":\"true\",\"{s}\":null}}", .{key});
     defer alloc.free(long_key);

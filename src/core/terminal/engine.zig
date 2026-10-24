@@ -641,6 +641,8 @@ pub const Grid = struct {
         while (i < bytes.len) {
             const b = bytes[i];
             if (b == 0x18 or b == 0x1a) {
+                // A character split across reads ends here, as it would in one read.
+                if (self.utf8_len != 0) try self.writePendingUtf8();
                 self.cancelControlSequence();
                 i += 1;
                 continue;
@@ -1659,8 +1661,9 @@ pub const Grid = struct {
             return;
         }
         if (report != 6) return;
+        // DECRC and VPA can leave the cursor above the top margin.
         const row = if (self.origin_mode)
-            self.cursor_row - self.scroll_top + 1
+            (self.cursor_row -| self.scroll_top) + 1
         else
             self.cursor_row;
         var buffer: [64]u8 = undefined;
@@ -2566,12 +2569,23 @@ pub const Grid = struct {
                 // With DECAWM disabled, terminals can drop suffix codepoints
                 // from a display unit whose base ends at the right margin.
                 if (guard_margin_suffix) try out.writeAll("\x1b[?7h");
+                const disputed_width = suffix != null and hasVariationSelector(suffix.?);
+                // A terminal that draws this glyph one cell narrow never writes
+                // its second cell, so clear both first.
+                if (disputed_width and cell.width == 2) try out.writeAll("\x1b[2X");
                 try emitCodepoint(out, cell.codepoint);
                 if (suffix) |bytes| {
                     try out.writeAll(bytes);
                 }
                 if (guard_margin_suffix) try out.writeAll("\x1b[?7l");
                 col += cell.width;
+                // Terminals disagree on how wide a variation selector makes a
+                // glyph: Ghostty draws U+26A1 U+FE0E in one cell, tmux in two.
+                // Re-anchor the cursor so the cells after it land where this
+                // grid put them, or a later repaint misses one.
+                if (col <= last and disputed_width) {
+                    try out.print("\x1b[{d}G", .{col});
+                }
             }
         }
 
@@ -3348,6 +3362,12 @@ fn cellsEqual(a_grid: Grid, a: Cell, b_grid: Grid, b: Cell) bool {
     return std.mem.eql(u8, a_url, b_url) and std.mem.eql(u8, a_params, b_params);
 }
 
+/// Whether a cell's combining suffix holds VS15 or VS16, which terminals
+/// size differently.
+fn hasVariationSelector(suffix: []const u8) bool {
+    return std.mem.find(u8, suffix, "\u{FE0E}") != null or std.mem.find(u8, suffix, "\u{FE0F}") != null;
+}
+
 fn hasShiftedWideCellOverlap(
     prev: Grid,
     next: Grid,
@@ -3909,6 +3929,24 @@ test "DSR 6n is swallowed without side effects" {
     try expectRow(g, 1, "ok");
 }
 
+test "DSR 6n in origin mode reports row 1 for a cursor above the top margin" {
+    const cases = [_][]const u8{
+        // DECRC restores a row saved before the top margin moved down.
+        "\x1b[6r\x1b[?6h\x1b7\x1b[7r\x1b8",
+        // VPA moves to an absolute row.
+        "\x1b[3r\x1b[?6h\x1b[1d",
+    };
+    for (cases) |setup| {
+        var g = try Grid.init(testing.allocator, 10, 9);
+        defer g.deinit();
+        try g.feed(setup);
+        var result = try g.feedMode("\x1b[6n", .native_live);
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 1), result.replies.items.len);
+        try testing.expectEqualStrings("\x1b[1;1R", result.replies.items[0].bytes);
+    }
+}
+
 test "resize grows keeping top-left content" {
     var g = try Grid.init(testing.allocator, 4, 2);
     defer g.deinit();
@@ -4013,6 +4051,37 @@ test "repeated scroll rotations preserve logical rows through clone resize and e
     try expectRow(grid, 3, "five");
     try expectRow(grid, 4, "");
     try testing.expectEqual(@as(u16, 0), grid.row_origin);
+}
+
+test "diff re-anchors the cursor after a glyph with a variation selector" {
+    // The status line: a text-presentation lightning bolt, then a right-hand
+    // notice placed after it. A terminal that draws the bolt one cell narrow
+    // must still put the notice, and later its erasure, in the same cells.
+    var previous = try Grid.init(testing.allocator, 20, 1);
+    defer previous.deinit();
+    var target = try Grid.init(testing.allocator, 20, 1);
+    defer target.deinit();
+    try target.feed("a \u{26A1}\u{FE0E}\x1b[12G13 MCP");
+
+    var diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer diff.deinit();
+    try Grid.diffTo(previous, target, &diff.writer);
+    // Both of its cells are cleared first, so a narrow drawing leaves no stale
+    // second cell, then the cursor is re-anchored after it.
+    try testing.expect(std.mem.find(u8, diff.written(), "\x1b[2X\u{26A1}\u{FE0E}\x1b[5G") != null);
+    try previous.feed(diff.written());
+    try testing.expect(gridsEqual(previous, target));
+
+    // A glyph without a selector needs no anchor.
+    var plain_prev = try Grid.init(testing.allocator, 20, 1);
+    defer plain_prev.deinit();
+    var plain = try Grid.init(testing.allocator, 20, 1);
+    defer plain.deinit();
+    try plain.feed("a \u{26A1} b");
+    var plain_diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer plain_diff.deinit();
+    try Grid.diffTo(plain_prev, plain, &plain_diff.writer);
+    try testing.expect(std.mem.find(u8, plain_diff.written(), "G") == null);
 }
 
 test "diff compares logical rows across different physical origins" {
@@ -4859,6 +4928,10 @@ test "UTF-8 gives the same state however the output is split into reads" {
         "\xe7\x95\x8c\xbaz",
         "\xe7\x95\x8c",
         "e\xcc\x81!",
+        // CAN and SUB interrupt a character like any other control byte.
+        "a\xd6\x18",
+        "\xe7\x18\x95\x8cz",
+        "\xe7\x95\x1a\x8cz",
     };
     for (cases) |bytes| {
         var whole = try Grid.init(testing.allocator, 8, 1);
@@ -5183,6 +5256,191 @@ test "bounded deterministic parser and checkpoint fuzz" {
         defer testing.allocator.free(repeated);
         try testing.expectEqualSlices(u8, payload, repeated);
     }
+}
+
+/// Pieces of terminal output for the grid fuzz test: text and UTF-8 of every
+/// shape, controls, escape sequences, and broken bytes.
+const fuzz_terminal_pieces = [_][]const u8{
+    "a",                   "Hello",              " ",
+    "\u{e9}",              "\u{754c}",           "\u{1f600}",
+    "e\u{301}",            "\u{1f44d}\u{1f3fd}", "\u{1f1fa}\u{1f1f8}",
+    "\u{2600}\u{fe0f}",    "\xff",               "\xe7\x95",
+    "\r",                  "\n",                 "\t",
+    "\x08",                "\x07",               "\x1b7",
+    "\x1b8",               "\x1bM",              "\x1bD",
+    "\x1bE",               "\x1bc",              "\x1b[?1049h",
+    "\x1b[?1049l",         "\x1b[?7l",           "\x1b[?7h",
+    "\x1b[?6h",            "\x1b[?6l",           "\x1b[4h",
+    "\x1b[4l",             "\x1b[?25l",          "\x1b]8;;https://e.x/1\x1b\\",
+    "\x1b]8;;\x1b\\",      "\x1b]0;title\x07",   "\x1bPq#0\x1b\\",
+    "\x1b[38;2;10;20;30m", "\x1b[48;5;236m",     "\x1b",
+};
+
+/// CSI final bytes the grid fuzz test pairs with generated parameters.
+const fuzz_csi_finals = "ABCDEFGHJKSTXdfmr@LMPhlnsu";
+
+fn appendFuzzTerminalBytes(alloc: Allocator, smith: *std.testing.Smith, out: *std.ArrayList(u8)) !void {
+    for (0..smith.valueRangeAtMost(u8, 0, 48)) |_| {
+        switch (smith.valueRangeAtMost(u8, 0, 9)) {
+            0...5 => try out.appendSlice(alloc, fuzz_terminal_pieces[smith.index(fuzz_terminal_pieces.len)]),
+            6...8 => {
+                try out.appendSlice(alloc, "\x1b[");
+                if (smith.boolWeighted(1, 5)) try out.append(alloc, '?');
+                for (0..smith.valueRangeAtMost(u8, 0, 3)) |index| {
+                    if (index > 0) try out.append(alloc, ';');
+                    var number: [8]u8 = undefined;
+                    try out.appendSlice(alloc, try std.mem.print(&number, "{d}", .{smith.valueRangeAtMost(u16, 0, 300)}));
+                }
+                try out.append(alloc, fuzz_csi_finals[smith.index(fuzz_csi_finals.len)]);
+            },
+            else => try out.append(alloc, smith.value(u8)),
+        }
+    }
+}
+
+fn feedFuzzFragments(grid: *Grid, bytes: []const u8, smith: *std.testing.Smith) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const length = @min(bytes.len - offset, @as(usize, smith.valueRangeAtMost(u8, 1, 16)));
+        try grid.feed(bytes[offset .. offset + length]);
+        offset += length;
+    }
+}
+
+/// The checkpoint `grid` saves once its combining suffix pool holds only the
+/// suffixes its cells use, in cell order. The pool keeps every suffix a cell
+/// ever had, so equal states can reach different pools.
+fn fuzzCanonicalCheckpoint(grid: Grid) ![]u8 {
+    const alloc = testing.allocator;
+    const payload = try grid.checkpointPayload(alloc);
+    defer alloc.free(payload);
+    var copy = try Grid.restoreCheckpoint(alloc, payload);
+    defer copy.deinit();
+
+    var pool: std.ArrayList([]u8) = .empty;
+    defer {
+        for (pool.items) |suffix| alloc.free(suffix);
+        pool.deinit(alloc);
+    }
+    var cells: std.ArrayList(*Cell) = .empty;
+    defer cells.deinit(alloc);
+    for (copy.cells) |*cell| try cells.append(alloc, cell);
+    if (copy.saved_normal_screen) |*saved| for (saved.cells) |*cell| try cells.append(alloc, cell);
+    if (copy.last_column_write) |*write| for (&write.replaced) |*cell| try cells.append(alloc, cell);
+    for (cells.items) |cell| {
+        const suffix = copy.combiningSuffix(cell.combining_suffix_id) orelse continue;
+        const position = for (pool.items, 0..) |existing, i| {
+            if (std.mem.eql(u8, existing, suffix)) break i;
+        } else appended: {
+            try pool.append(alloc, try alloc.dupe(u8, suffix));
+            break :appended pool.items.len - 1;
+        };
+        cell.combining_suffix_id = @intCast(position + 1);
+    }
+
+    for (copy.combining_suffix_pool.items) |suffix| alloc.free(suffix);
+    copy.combining_suffix_pool.clearRetainingCapacity();
+    copy.combining_pool_bytes = 0;
+    for (pool.items) |suffix| {
+        try copy.combining_suffix_pool.append(alloc, suffix);
+        copy.combining_pool_bytes += suffix.len;
+    }
+    pool.clearRetainingCapacity();
+    return copy.checkpointPayload(alloc);
+}
+
+/// Whether two grids show the same cells. Separate grids keep separate pools,
+/// so links compare by target and suffixes by text, not by pool index.
+fn fuzzScreensEqual(a: Grid, b: Grid) bool {
+    if (a.rows != b.rows or a.cols != b.cols) return false;
+    var row: u16 = 1;
+    while (row <= a.rows) : (row += 1) {
+        var col: u16 = 1;
+        while (col <= a.cols) : (col += 1) {
+            var x = a.cellAt(row, col).?;
+            var y = b.cellAt(row, col).?;
+            const x_link = x.style.hyperlink_id;
+            const y_link = y.style.hyperlink_id;
+            if ((x_link == 0) != (y_link == 0)) return false;
+            if (x_link != 0) {
+                const x_url = a.hyperlinkUrl(x_link) orelse return false;
+                const y_url = b.hyperlinkUrl(y_link) orelse return false;
+                const x_params = a.hyperlinkParams(x_link) orelse return false;
+                const y_params = b.hyperlinkParams(y_link) orelse return false;
+                if (!std.mem.eql(u8, x_url, y_url) or !std.mem.eql(u8, x_params, y_params)) return false;
+            }
+            const x_suffix = a.combiningSuffix(x.combining_suffix_id) orelse "";
+            const y_suffix = b.combiningSuffix(y.combining_suffix_id) orelse "";
+            if (!std.mem.eql(u8, x_suffix, y_suffix)) return false;
+            x.style.hyperlink_id = 0;
+            y.style.hyperlink_id = 0;
+            x.combining_suffix_id = 0;
+            y.combining_suffix_id = 0;
+            if (!cellsEqual(a, x, b, y)) return false;
+        }
+    }
+    return true;
+}
+
+/// Repaints `screen`, a model of the user's terminal, to show `to` the way the
+/// renderer does: from a diff against the model, whose pen is the terminal's.
+fn expectFuzzRepaint(screen: *Grid, to: Grid) !void {
+    var diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer diff.deinit();
+    try Grid.diffTo(screen.*, to, &diff.writer);
+    try screen.feed(diff.written());
+    try testing.expect(fuzzScreensEqual(screen.*, to));
+}
+
+fn fuzzGridFeed(_: void, smith: *std.testing.Smith) !void {
+    const alloc = testing.allocator;
+    const cols = smith.valueRangeAtMost(u16, 1, 40);
+    const rows = smith.valueRangeAtMost(u16, 1, 10);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(alloc);
+    try appendFuzzTerminalBytes(alloc, smith, &bytes);
+    const split = smith.index(bytes.items.len + 1);
+
+    // Output split into reads of any size reaches the same state.
+    var whole = try Grid.init(alloc, cols, rows);
+    defer whole.deinit();
+    var pieces = try Grid.init(alloc, cols, rows);
+    defer pieces.deinit();
+    const pieces_fed = feedFuzzFragments(&pieces, bytes.items, smith);
+    whole.feed(bytes.items) catch |err| return testing.expectError(err, pieces_fed);
+    try pieces_fed;
+    const state = whole.checkpointPayload(alloc) catch |err| return testing.expectError(err, pieces.checkpointPayload(alloc));
+    defer alloc.free(state);
+    const canonical = try fuzzCanonicalCheckpoint(whole);
+    defer alloc.free(canonical);
+    const pieces_canonical = try fuzzCanonicalCheckpoint(pieces);
+    defer alloc.free(pieces_canonical);
+    try testing.expectEqualSlices(u8, canonical, pieces_canonical);
+
+    // A restored checkpoint saves the same state again.
+    var restored = try Grid.restoreCheckpoint(alloc, state);
+    defer restored.deinit();
+    const repeated = try restored.checkpointPayload(alloc);
+    defer alloc.free(repeated);
+    try testing.expectEqualSlices(u8, state, repeated);
+
+    // A terminal in its default modes shows each frame after its repaint.
+    var previous = try Grid.init(alloc, cols, rows);
+    defer previous.deinit();
+    try previous.feed(bytes.items[0..split]);
+    var next = try previous.clone(alloc);
+    defer next.deinit();
+    try next.feed(bytes.items[split..]);
+    var screen = try Grid.init(alloc, cols, rows);
+    defer screen.deinit();
+    try expectFuzzRepaint(&screen, previous);
+    try expectFuzzRepaint(&screen, next);
+}
+
+test "terminal grid state survives fragmented feeds, checkpoints, and repaints" {
+    try std.testing.fuzz({}, fuzzGridFeed, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").terminal_grid.*),
+    });
 }
 
 test "bounded deterministic corrupt checkpoint fuzz" {

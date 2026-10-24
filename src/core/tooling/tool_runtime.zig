@@ -3271,6 +3271,120 @@ test "ask_user_question worker bridge preserves allocator ownership" {
     try std.testing.expectEqualStrings("Run tests", state.answers.?[0]);
 }
 
+const FullQuestionBatchExecution = struct {
+    ctx: Context,
+    arena: Allocator,
+    call: ToolCall,
+    max_tool_result_bytes: usize,
+    result: ?ToolExecutionResult = null,
+    err: ?anyerror = null,
+
+    fn run(self: *FullQuestionBatchExecution) void {
+        self.result = executeToolCallAuthorized(self.ctx, .{
+            .call_allocator = self.arena,
+            .result_allocator = self.arena,
+            .call = self.call,
+            .authority = .ordinary,
+            .session_grants = &.{},
+            .advertised_dynamic_tool_names = &.{},
+            .max_tool_result_bytes = self.max_tool_result_bytes,
+        }) catch |err| {
+            self.err = err;
+            return;
+        };
+    }
+};
+
+test "ask_user_question carries a full batch from model arguments through the worker prompt to the model result" {
+    const question_answer = @import("../agent/question_answer.zig");
+    const question_prompt = @import("../agent/question_prompt.zig");
+    const alloc = std.testing.allocator;
+    const batch_len = question_answer.max_questions;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var args: std.Io.Writer.Allocating = .init(arena);
+    try args.writer.writeAll("{\"questions\":[");
+    for (0..batch_len) |question| {
+        if (question > 0) try args.writer.writeByte(',');
+        try args.writer.print(
+            "{{\"question\":\"Batch question {d}?\",\"options\":[{{\"label\":\"Keep {d}\"}},{{\"label\":\"Change {d}\",\"description\":\"Apply the change.\"}}]}}",
+            .{ question + 1, question + 1, question + 1 },
+        );
+    }
+    try args.writer.writeAll("]}");
+
+    const tools = [_]tool_dispatch.Tool{test_builtin_tools.ask_user_question};
+    var rt = TestRuntime{ .tool_registry = .{ .tools = tools[0..] } };
+    // The worker side of the question bridge allocates with `c_allocator`.
+    defer {
+        rt.worker.deinit(std.heap.c_allocator);
+        rt.session.deinit(alloc);
+    }
+    var execution = FullQuestionBatchExecution{
+        .ctx = rt.context(),
+        .arena = arena,
+        .call = .{ .id = "ask-full-batch", .name = "ask_user_question", .arguments_json = args.written() },
+        .max_tool_result_bytes = rt.max_tool_result_bytes,
+    };
+    const thread = try std.Thread.spawn(.{}, FullQuestionBatchExecution.run, .{&execution});
+    var thread_joined = false;
+    defer if (!thread_joined) {
+        rt.worker.requestStop();
+        thread.join();
+    };
+
+    // The interactive side receives the whole batch as one prompt.
+    var snapshot = try waitForQuestionBridgeSnapshot(&rt.worker);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, batch_len), snapshot.entries.len);
+    var prompt: question_prompt.QuestionPrompt = .{};
+    defer prompt.deinit(alloc);
+    try prompt.syncFrom(alloc, snapshot.entries);
+
+    // Even pages keep their first option and odd pages take the second.
+    for (0..batch_len) |page| {
+        const projection = prompt.projection().?;
+        try std.testing.expectEqual(page, projection.current_index);
+        var question_buf: [32]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            try std.mem.print(&question_buf, "Batch question {d}?", .{page + 1}),
+            projection.current_entry.?.question,
+        );
+        const event = try prompt.apply(alloc, .{ .select_ordinal = @intCast(page % 2) });
+        if (page + 1 < batch_len) {
+            try std.testing.expectEqual(question_prompt.QuestionInputEvent{ .decision = @intCast(page) }, event);
+        } else {
+            try std.testing.expectEqual(question_prompt.QuestionInputEvent.all_decided, event);
+        }
+    }
+    var labels: [batch_len][]const u8 = undefined;
+    for (&labels, prompt.entries.items) |*label, entry| label.* = entry.answer.?;
+    try rt.worker.submitQuestionBatchAnswer(std.heap.c_allocator, &labels);
+    thread.join();
+    thread_joined = true;
+
+    if (execution.err) |err| return err;
+    const result = execution.result.?;
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
+    const answers = (try question_answer.decodeJson(arena, result.model_output)).?;
+    try std.testing.expectEqual(@as(usize, batch_len), answers.len);
+    for (answers, 0..) |pair, page| {
+        var question_buf: [32]u8 = undefined;
+        var answer_buf: [32]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            try std.mem.print(&question_buf, "Batch question {d}?", .{page + 1}),
+            pair.question,
+        );
+        try std.testing.expectEqualStrings(
+            try std.mem.print(&answer_buf, "{s} {d}", .{ if (page % 2 == 0) "Keep" else "Change", page + 1 }),
+            pair.answer,
+        );
+    }
+    try std.testing.expect(try rt.worker.snapshotPendingQuestionBatch(alloc) == null);
+}
+
 test "ask_user_question execution uses supplied registry entry and interactive host capability" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -6139,7 +6253,7 @@ test "shell run rejects legacy background input without creating state" {
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
     try expectContains(result.model_output, "\"code\":\"invalid_shell_request\"");
-    try expectContains(result.model_output, "request.background is not accepted for run.");
+    try expectContains(result.model_output, "\"background is not accepted for run.\"");
     try std.testing.expect(std.mem.find(u8, result.model_output, "retry_with") == null);
 }
 

@@ -2143,12 +2143,12 @@ fn fuzzElicitationJson(_: void, smith: *std.testing.Smith) !void {
 
 test "elicitation request and response parsers stay bounded under fuzzed bytes" {
     try std.testing.fuzz({}, fuzzElicitationJson, .{
-        .corpus = &.{
+        .corpus = &(@import("fuzz_seed").slices(.{
             "{}",
             "{\"mode\":\"form\",\"requestedSchema\":{}}",
             "{\"action\":\"accept\",\"content\":{}}",
             "{\"mode\":\"url\",\"url\":\"https://example.test\"}",
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"id\"}}",
-        },
+        }) ++ @import("fuzz_corpus").mcp_elicitation.*),
     });
 }

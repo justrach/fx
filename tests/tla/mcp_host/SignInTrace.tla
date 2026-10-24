@@ -25,14 +25,15 @@ Viol ==
     (IF NoListenerWithoutHost THEN {} ELSE {"NoListenerWithoutHost"}) \cup
     (IF OneSignInPerHost THEN {} ELSE {"OneSignInPerHost"}) \cup
     (IF IndicatorImpliesListener THEN {} ELSE {"IndicatorImpliesListener"}) \cup
-    (IF OneSignInPerServer THEN {} ELSE {"OneSignInPerServer"})
+    (IF OneSignInPerServer THEN {} ELSE {"OneSignInPerServer"}) \cup
+    (IF FlowHasListener THEN {} ELSE {"FlowHasListener"})
 
 Probed(k, result) ==
     /\ IF result = "open" THEN phase[k] = "open" /\ alive[hostOf[k]] ELSE ~Open(k)
     /\ UNCHANGED vars
 
 Step(rec) ==
-    CASE rec.event = "login" -> StartLogin
+    CASE rec.event = "login" -> StartLogin \/ AgainLogin
       [] rec.event = "authorize" -> Authorize(rec.data.login)
       [] rec.event = "probe" -> Probed(rec.data.login, rec.data.result)
       [] rec.event = "callback" -> Arrive(rec.data.login, rec.data.state, rec.data.kind)

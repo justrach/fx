@@ -25,7 +25,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
-import { copyV1Fixture, savedSession, savedSessionIds, savedText, savedToolResults, sessionDir, storeRoot } from "./saved-sessions";
+import { copyV1Fixture, savedSession, savedSessionIds, savedText, savedToolResults, sessionDir, storeRoot, withoutConversionNotice } from "./saved-sessions";
 
 const TIMEOUT = 30_000;
 
@@ -142,7 +142,7 @@ test("a session converts the same whatever its old replay cache holds", async ()
       fault(join(fixture.home, ".fx", "sessions", id!, "history-cache.bin"));
       const continued = await continueSession(fixture, gateway, id!);
       expect(continued.code).toBe(0);
-      expect(continued.stderr).toBe("");
+      expect(withoutConversionNotice(continued.stderr)).toBe("");
       expect(JSON.parse(continued.stdout).output).toBe("CACHE_CONTINUED_TURN");
       expect(gateway.requests[0]!.body).toContain("CONV_FIRST_ANSWER");
       const history = (await savedSession(fixture.home, id!)).history;
@@ -166,7 +166,7 @@ test("latest resume converts the newest session and leaves an unrelated pending 
     writeFileSync(join(orphan, "events.jsonl"), "unidentified saved data\n", { mode: 0o600 });
     const resumed = await continueSession(fixture, gateway, "", true);
     expect(resumed.code).toBe(0);
-    expect(resumed.stderr).toBe("");
+    expect(withoutConversionNotice(resumed.stderr)).toBe("");
     // The newest of the three, as v0.0.14 would have picked.
     expect(JSON.parse(resumed.stdout).session_id).toBe(ids[2]!);
     expect(gateway.requests.at(-1)?.body).toContain("CONV_FIRST 3");
@@ -186,7 +186,7 @@ test("a session converts past a damaged usage file left by an older fx", async (
     writeFileSync(join(fixture.home, ".fx", "sessions", id!, "usage-v2.json"), "{broken accounting", { mode: 0o600 });
     const resumed = await continueSession(fixture, gateway, id!);
     expect(resumed.code).toBe(0);
-    expect(resumed.stderr).toBe("");
+    expect(withoutConversionNotice(resumed.stderr)).toBe("");
     expect(JSON.parse(resumed.stdout).session_id).toBe(id!);
     expect(gateway.requests.at(-1)?.body).toContain("CONV_FIRST_ANSWER");
     expect((await savedSession(fixture.home, id!)).history_len).toBe(2);
@@ -983,7 +983,7 @@ describe("session recovery", () => {
           cwd: fixture.workspace, env: legacyGatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
         });
         expect(result.code).toBe(0);
-        expect(result.stderr).toBe("");
+        expect(withoutConversionNotice(result.stderr)).toBe("");
         expect(JSON.parse(result.stdout)).toMatchObject({
           session_id: legacy.id, model: FAKE_GATEWAY_MODEL, tool_calls: [],
           output: index === 0 ? "LEGACY_ASK_SAVED" : "LEGACY_ASK_REOPEN_SAVED",
@@ -1038,7 +1038,7 @@ describe("session recovery", () => {
           cwd: fixture.workspace, env: legacyGatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
         });
         expect(result.code).toBe(0);
-        expect(result.stderr).toBe("");
+        expect(withoutConversionNotice(result.stderr)).toBe("");
         expect(JSON.parse(result.stdout)).toMatchObject({
           session_id: legacy.id, output: "SUPERSESSION_ASK_SAVED", tool_calls: [],
         });
@@ -1153,7 +1153,7 @@ describe("session recovery", () => {
 
       const resumed = await continueSession(fixture, gateway, sessionId, true);
       expect(resumed.code).toBe(0);
-      expect(resumed.stderr).toBe("");
+      expect(withoutConversionNotice(resumed.stderr)).toBe("");
       expect(JSON.parse(resumed.stdout).session_id).toBe(sessionId);
       expect(JSON.parse(resumed.stdout).output).toBe("PARTIAL_RECORD_RECOVERED");
       expect(gateway.requests).toHaveLength(1);
@@ -1200,7 +1200,7 @@ describe("session recovery", () => {
 
         const resumed = await continueSession(fixture, gateway, sessionId);
         expect(resumed.code).toBe(0);
-        expect(resumed.stderr).toBe("");
+        expect(withoutConversionNotice(resumed.stderr)).toBe("");
         expect(JSON.parse(resumed.stdout).output).toBe("UNFINISHED_TURN_RECOVERED");
         expect(gateway.requests).toHaveLength(1);
         // The unanswered prompt stays, as an interrupted turn (D1, D77);

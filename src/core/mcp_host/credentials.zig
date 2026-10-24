@@ -4,13 +4,21 @@
 //! Either way the directory's advisory lock is held while the store is read
 //! and rewritten, so two fx processes don't overwrite each other's entries.
 //! A store this fx can't read, damaged or saved by a newer fx, is never
-//! written over. v1's logins are never taken over: an older fx and this
-//! one refreshing one login apart, neither seeing the other's saves, would
-//! sign it out. One fx refreshes a login at a time, under that login's
+//! written over. One fx refreshes a login at a time, under that login's
 //! refresh lock.
 //!
-//! TLA+ models: `tests/tla/mcp_host/Credentials.tla` and, for logins shared between
-//! processes, `tests/tla/mcp_host/SharedLogins.tla`.
+//! Older stores are never read or taken over: v1's `credentials.json`, and
+//! `credentials-v2.json` (Keychain item `FX_MCP_OAUTH_CREDENTIALS_V2`). Builds
+//! from before version 2 of the document read a version-2 store as empty and
+//! write it back, erasing every login in it, and fx processes still running
+//! those builds keep refreshing the logins they hold in memory. A login
+//! shared with them would be refreshed apart and signed out, so this store
+//! starts empty, in files and a Keychain item no older fx opens, and each
+//! server signs in once.
+//!
+//! TLA+ models: `tests/tla/mcp_host/Credentials.tla`; for logins shared between
+//! processes, `tests/tla/mcp_host/SharedLogins.tla`; and for processes running
+//! older builds beside this one, `tests/tla/mcp_host/MixedBuilds.tla`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -22,9 +30,10 @@ const secret = @import("../auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
 
-const file_name = "credentials-v2.json";
-/// The same lock as v1's store, so the directory has one owner at a time.
-const lock_file_name = "credentials.lock";
+const file_name = "credentials-v3.json";
+/// Not `credentials.lock`, which older builds hold while they read and
+/// rewrite their own stores: nothing here waits on them.
+const lock_file_name = "credentials-v3.lock";
 const lock_deadline_ms: u64 = 2_000;
 const max_store_bytes: usize = 1024 * 1024;
 
@@ -67,12 +76,18 @@ pub const Store = struct {
     /// The credential saved under `key`, or null, also when the store can't be
     /// read. The caller owns it and frees it with `secret.zeroAndFree`.
     pub fn get(s: Store, alloc: Allocator, key: Key) !?[]u8 {
+        return s.lookup(alloc, key) catch |err| switch (err) {
+            error.CredentialStoreUnreadable => null,
+            else => err,
+        };
+    }
+
+    /// `get`, except that a store it can't read fails with
+    /// `error.CredentialStoreUnreadable`, so null means none is saved.
+    pub fn lookup(s: Store, alloc: Allocator, key: Key) !?[]u8 {
         var locked = try s.lock();
         defer locked.release();
-        var doc = s.read(alloc, &locked.dir) catch |err| switch (err) {
-            error.CredentialStoreUnreadable => return null,
-            else => return err,
-        };
+        var doc = try s.read(alloc, &locked.dir);
         defer doc.deinit(alloc);
         const i = doc.find(key) orelse return null;
         return try alloc.dupe(u8, doc.entries.items[i].credential);
@@ -213,11 +228,7 @@ pub const Store = struct {
             std.crypto.secureZero(u8, out.writer.buffer);
             out.deinit();
         }
-        // Version 2: an fx that reads only version 1 treats the store as
-        // newer and never writes over it, so it can't take over v1's logins
-        // or drop a login's workspace. A profile server's entry has no
-        // workspace field.
-        try std.json.Stringify.value(.{ .version = 2, .servers = doc.entries.items }, .{ .emit_null_optional_fields = false }, &out.writer);
+        try doc.encode(&out.writer);
         switch (s.backend) {
             .keychain => try native_keychain.storeMcpHostCredentials(out.written()),
             .file => try io_mod.durableReplaceVerified(alloc, dir, file_name, out.written()),
@@ -232,8 +243,14 @@ pub fn digest(bytes: []const u8) [32]u8 {
     return out;
 }
 
-/// `refresh-` and 16 hex digits of the key's digest: one file per login.
-fn refreshLockName(key: Key) [29]u8 {
+/// Older builds lock `refresh-<digest>.lock` for the same login in their own
+/// store, and its tokens are not this store's.
+const refresh_lock_prefix = "refresh-v3-";
+const refresh_lock_suffix = ".lock";
+const RefreshLockName = [refresh_lock_prefix.len + 16 + refresh_lock_suffix.len]u8;
+
+/// The prefix and 16 hex digits of the key's digest: one file per login.
+fn refreshLockName(key: Key) RefreshLockName {
     var h: std.crypto.hash.sha2.Sha256 = .init(.{});
     for ([_][]const u8{ key.name, key.url, key.workspace orelse "" }) |part| {
         h.update(part);
@@ -241,10 +258,10 @@ fn refreshLockName(key: Key) [29]u8 {
     }
     var d: [32]u8 = undefined;
     h.final(&d);
-    var name: [29]u8 = undefined;
-    @memcpy(name[0..8], "refresh-");
-    @memcpy(name[8..24], &std.fmt.bytesToHex(d[0..8].*, .lower));
-    @memcpy(name[24..], ".lock");
+    var name: RefreshLockName = undefined;
+    @memcpy(name[0..refresh_lock_prefix.len], refresh_lock_prefix);
+    @memcpy(name[refresh_lock_prefix.len..][0..16], &std.fmt.bytesToHex(d[0..8].*, .lower));
+    @memcpy(name[refresh_lock_prefix.len + 16 ..], refresh_lock_suffix);
     return name;
 }
 
@@ -312,6 +329,14 @@ const Doc = struct {
     fn deinit(d: *Doc, alloc: Allocator) void {
         for (d.entries.items) |*e| e.deinit(alloc);
         d.entries.deinit(alloc);
+    }
+
+    /// The document as `Store.write` saves it. Version 2, the format
+    /// `credentials-v2.json` holds. No build that reads only version 1 opens
+    /// this store: those read a version-2 document as empty and write over
+    /// it. A profile server's entry has no workspace field.
+    fn encode(d: *const Doc, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try std.json.Stringify.value(.{ .version = 2, .servers = d.entries.items }, .{ .emit_null_optional_fields = false }, w);
     }
 
     fn find(d: *const Doc, key: Key) ?usize {
@@ -471,6 +496,94 @@ test "v1's logins aren't taken over, and an older fx's store with its flag is re
     try testing.expect(std.mem.find(u8, bytes, "imported_v1") == null);
 }
 
+test "credentials-v2.json's logins aren't taken over, and an older fx rewriting it never reaches this store" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    const store: Store = .{ .home = home, .backend = .file };
+    const plain: Key = .{ .name = "plain", .url = "https://mcp.plain.com/mcp" };
+    const v2_path = ".fx/" ++ profile_paths.mcp_credentials_dir_name ++ "/credentials-v2.json";
+    try tmp.dir.createDirPath(testing.io, ".fx/" ++ profile_paths.mcp_credentials_dir_name);
+    const v2 = "{\"version\":2,\"servers\":[{\"name\":\"plain\",\"url\":\"https://mcp.plain.com/mcp\",\"credential\":\"{\\\"access\\\":\\\"v2\\\"}\"}]}";
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = v2_path, .data = v2 });
+
+    // The V2 login is never read, so the server signs in again here.
+    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, plain));
+    try store.put(testing.allocator, plain, "{\"access\":\"v3\"}");
+
+    // An older fx reads version 2 as empty and writes its own store back.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = v2_path, .data = "{\"version\":1,\"imported_v1\":true,\"servers\":[]}" });
+    const kept = (try store.get(testing.allocator, plain)) orelse return error.TestUnexpectedResult;
+    defer secret.zeroAndFree(testing.allocator, kept);
+    try testing.expectEqualStrings("{\"access\":\"v3\"}", kept);
+    const old = try tmp.dir.readFileAlloc(testing.io, v2_path, testing.allocator, .limited(1 << 16));
+    defer testing.allocator.free(old);
+    try testing.expectEqualStrings("{\"version\":1,\"imported_v1\":true,\"servers\":[]}", old);
+
+    // Its refresh lock is apart from the one an older fx takes for its own copy.
+    const lock_name = refreshLockName(plain);
+    try testing.expect(std.mem.startsWith(u8, &lock_name, "refresh-v3-"));
+    try testing.expect(std.mem.endsWith(u8, &lock_name, ".lock"));
+}
+
+test "the store is the one no older fx opens" {
+    try testing.expectEqualStrings("credentials-v3.json", file_name);
+    try testing.expectEqualStrings("credentials-v3.lock", lock_file_name);
+    try testing.expectEqualStrings("FX_MCP_OAUTH_CREDENTIALS_V3", native_keychain.mcp_host_credentials_service_name);
+    try testing.expectEqualStrings("the Keychain item FX_MCP_OAUTH_CREDENTIALS_V3", (Store{ .home = "/Users/example", .backend = .keychain }).place());
+    try testing.expectEqualStrings("~/.fx/mcp-credentials/credentials-v3.json", (Store{ .home = "/Users/example", .backend = .file }).place());
+}
+
+/// A document that parses is saved as version 2 and reads back the same, so
+/// a write never leaves a store this fx can't read.
+fn fuzzStoreDocument(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [2048]u8 = undefined;
+    const len = smith.sliceWeightedBytes(&buffer, &.{
+        .rangeAtMost(u8, 0x20, 0x7e, 8),
+        .rangeAtMost(u8, 0x00, 0xff, 1),
+        .value(u8, '{', 4),
+        .value(u8, '}', 4),
+        .value(u8, '[', 3),
+        .value(u8, ']', 3),
+        .value(u8, '"', 4),
+        .value(u8, '\\', 2),
+        .value(u8, ':', 3),
+        .value(u8, ',', 3),
+    });
+    var doc = Doc.parse(testing.allocator, buffer[0..len]) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    defer doc.deinit(testing.allocator);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try doc.encode(&out.writer);
+    var again = try Doc.parse(testing.allocator, out.written());
+    defer again.deinit(testing.allocator);
+    try testing.expectEqual(doc.entries.items.len, again.entries.items.len);
+    for (doc.entries.items, again.entries.items) |a, b| {
+        try testing.expectEqualStrings(a.name, b.name);
+        try testing.expectEqualStrings(a.url, b.url);
+        try testing.expectEqualStrings(a.credential, b.credential);
+        try testing.expectEqualStrings(a.workspace orelse "", b.workspace orelse "");
+        try testing.expectEqual(a.workspace == null, b.workspace == null);
+    }
+}
+
+test "a store document that parses always saves back readable" {
+    try std.testing.fuzz({}, fuzzStoreDocument, .{
+        .corpus = &.{
+            "{\"version\":2,\"servers\":[]}",
+            "{\"version\":1,\"imported_v1\":true,\"servers\":[{\"name\":\"linear\",\"url\":\"https://mcp.linear.app/mcp\",\"credential\":\"{}\"}]}",
+            "{\"version\":2,\"servers\":[{\"name\":\"github\",\"url\":\"https://mcp.example.com/mcp\",\"workspace\":\"/Users/example/a\",\"credential\":\"{\\\"access\\\":\\\"a\\\"}\"}]}",
+            "{\"version\":2,\"servers\":[{\"name\":\"\\u00e9\",\"url\":\"\",\"credential\":\"\\n\\t\\\"\"}]}",
+            "{\"version\":3,\"servers\":[]}",
+            "not json",
+        },
+    });
+}
+
 test "one fx holds a login's refresh lock at a time, and each login has its own" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -502,15 +615,21 @@ test "the credential file is private, and one this fx can't read is never writte
     try store.put(testing.allocator, .{ .name = "plain", .url = url }, "{\"access\":\"p1\"}");
     const stat = try tmp.dir.statFile(testing.io, test_path, .{});
     try testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+    const found = (try store.lookup(testing.allocator, .{ .name = "plain", .url = url })).?;
+    defer testing.allocator.free(found);
+    try testing.expectEqualStrings("{\"access\":\"p1\"}", found);
+    try testing.expectEqual(@as(?[]u8, null), try store.lookup(testing.allocator, .{ .name = "linear", .url = url }));
 
-    // A damaged file, then one a newer fx saved: no login is found, a
-    // sign-in or sign-out fails, and the file stays as it was.
+    // A damaged file, then one a newer fx saved: no login is found, though
+    // `lookup` says it can't tell, a sign-in or sign-out fails, and the
+    // file stays as it was.
     for ([_][]const u8{
         "not json",
         "{\"version\":3,\"imported_v1\":true,\"servers\":[{\"name\":\"plain\",\"url\":\"https://mcp.plain.com/mcp\",\"credential\":\"{}\"}]}",
     }) |bytes| {
         try tmp.dir.writeFile(testing.io, .{ .sub_path = test_path, .data = bytes });
         try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, .{ .name = "plain", .url = url }));
+        try testing.expectError(error.CredentialStoreUnreadable, store.lookup(testing.allocator, .{ .name = "plain", .url = url }));
         try testing.expectError(error.CredentialStoreUnreadable, store.check(testing.allocator));
         try testing.expectError(error.CredentialStoreUnreadable, store.put(testing.allocator, .{ .name = "plain", .url = url }, "{\"access\":\"p2\"}"));
         try testing.expectError(error.CredentialStoreUnreadable, store.remove(testing.allocator, .{ .name = "plain", .url = url }));

@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { savedSessionIds, sessionDir, storeRoot } from "./saved-sessions";
+import { readStatusPanel } from "./info-panel";
 import {
   composerContains,
   FAKE_GATEWAY_MODEL,
@@ -238,8 +239,9 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForComposer(TIMEOUT);
       }
       expect(fixture.requests).toHaveLength(6);
-      await session.sendText("/status");
-      await session.waitForText(`provider_endpoint=${fixture.settings.providers.local.base_url}`, TIMEOUT);
+      const status = await readStatusPanel(session, TIMEOUT);
+      expect(status.fields.Provider).toBe("local");
+      expect(status.fields.Endpoint).toBe(fixture.settings.providers.local.base_url);
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/compact");
       const until = Date.now() + TIMEOUT;

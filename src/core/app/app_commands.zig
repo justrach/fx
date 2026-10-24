@@ -34,6 +34,7 @@ const display_width = @import("../shared/display_width.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const session_commands = @import("../session/session_commands.zig");
+const info_panel = @import("../input/info_panel.zig");
 const usage = @import("../../usage/usage.zig");
 const usage_host = @import("usage_host.zig");
 const types = @import("../shared/types.zig");
@@ -515,9 +516,37 @@ pub fn Handlers(comptime App: type) type {
             }
         }
 
+        /// `/status` opens its panel in the footer, like `/usage`, and
+        /// writes nothing to the transcript.
         fn commandShowStatus(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try session_commands.Commands(App).showStatus(app);
+            openInfoPanel(app, try session_commands.Commands(App).openStatusSnapshot(app));
+        }
+
+        /// Shows `snapshot` in place of any other footer menu. Takes ownership.
+        fn openInfoPanel(app: *App, snapshot: info_panel.Snapshot) void {
+            if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+            if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
+            closeHelpMenuIfPresent(app);
+            app.input_runtime.settings_menu.close();
+            closeInlineCommandMenusIfPresent(app);
+            app.input_runtime.info_panel.open(snapshot);
+            app.shell.render_requests.request(.footer);
+        }
+
+        /// Rebuilds the open `/status` or `/permissions` panel when a running
+        /// turn changed what it shows. Returns whether it did, so the footer
+        /// repaints.
+        pub fn collectInfoPanelFacts(app: *App) !bool {
+            const panel = &app.input_runtime.info_panel;
+            if (!panel.active) return false;
+            const shown = if (panel.snapshot) |*snapshot| snapshot else return false;
+            const next = (switch (shown.kind()) {
+                .status => try session_commands.Commands(App).refreshedStatusSnapshot(app, shown),
+                .permissions => try session_commands.Commands(App).refreshedPermissionsSnapshot(app, shown),
+            }) orelse return false;
+            panel.replace(next);
+            return true;
         }
 
         fn commandAttachImage(ctx: *anyopaque, path: []const u8) !void {
@@ -535,51 +564,16 @@ pub fn Handlers(comptime App: type) type {
             try session_commands.Commands(App).handleModel(app, query);
         }
 
+        /// Bare `/permissions` opens its panel and writes nothing to the
+        /// transcript; a subcommand changes the mode or a saved-session rule.
         fn commandHandlePermissions(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (std.mem.trim(u8, rest, " \t").len == 0) {
+                openInfoPanel(app, try session_commands.Commands(App).openPermissionsSnapshot(app));
+                return;
+            }
             if (try handlePermissionRuleManagement(app, rest)) return;
             try session_commands.Commands(App).handlePermissions(app, rest);
-            if (std.mem.trim(u8, rest, " \t").len == 0) {
-                try writeSessionPermissionRules(app);
-            }
-        }
-
-        fn writeSessionPermissionRules(app: *App) !void {
-            if (comptime !@hasField(App, "session") or
-                !@hasDecl(@TypeOf(app.session), "snapshotPermissionState"))
-            {
-                return;
-            } else {
-                var snapshot = try app.session.snapshotPermissionState(app.alloc);
-                defer snapshot.deinit(app.alloc);
-                var out: std.Io.Writer.Allocating = .init(app.alloc);
-                defer out.deinit();
-                if (snapshot.rules.items.len == 0) {
-                    try out.writer.writeAll("saved-session permission rules: none");
-                } else {
-                    try out.writer.print(
-                        "saved-session permission rules ({d}):",
-                        .{snapshot.rules.items.len},
-                    );
-                    for (snapshot.rules.items) |rule| {
-                        var identity = try text_utils.encodeTerminalSafe(
-                            app.alloc,
-                            rule.display_identity,
-                            session_permission_state.max_display_identity_bytes,
-                        );
-                        defer identity.deinit(app.alloc);
-                        try out.writer.print(
-                            "\n{d} {s} {s}",
-                            .{ rule.id.value, @tagName(rule.decision), identity.bytes },
-                        );
-                    }
-                }
-                try app.writeDomainNotice(.{
-                    .topic = "permissions",
-                    .tone = .neutral,
-                    .body = out.writer.buffered(),
-                }, true);
-            }
         }
 
         fn handlePermissionRuleManagement(app: *App, rest: []const u8) !bool {
@@ -1162,6 +1156,7 @@ pub fn Handlers(comptime App: type) type {
             if (comptime !@hasField(App, "input_runtime")) return;
             const InputRuntime = @TypeOf(app.input_runtime);
             if (comptime @hasField(InputRuntime, "statusline_menu")) app.input_runtime.statusline_menu.close();
+            if (comptime @hasField(InputRuntime, "info_panel")) app.input_runtime.info_panel.close();
             if (comptime @hasField(InputRuntime, "usage_menu")) closeUsageMenu(app);
             if (comptime @hasField(InputRuntime, "workspace_menu")) app.input_runtime.workspace_menu.close();
         }

@@ -61,7 +61,8 @@ pub const Event = struct {
         phase: Phase,
         /// A call ended. `answer` is set when the server answered, valid
         /// until the next `next`.
-        called: struct { call: Handle, outcome: Outcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call },
+        /// `oversized`: a lost call's answer was over the message limit.
+        called: struct { call: Handle, outcome: Outcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false },
         /// A call's server reported progress; `message` is terminal-safe and
         /// valid until the next `next`.
         progress: struct { call: Handle, progress: f64, total: ?f64, message: ?[]const u8 },
@@ -295,10 +296,15 @@ pub const Engine = struct {
     /// a sign-in, and starts the server; false when the server can't
     /// use it, so it is still signed out and nothing starts.
     pub fn useCredential(e: *Engine, name: []const u8, saved: []const u8) Error!bool {
-        const slot = try e.find(name);
-        if (!try (try e.ensureServer(slot)).useCredential(saved)) return false;
-        try e.step(slot, .need);
+        if (!try e.adoptCredential(name, saved)) return false;
+        try e.step(try e.find(name), .need);
         return true;
+    }
+
+    /// `useCredential` without starting the server, so a sign-out that
+    /// follows revokes that credential and nothing is sent with it first.
+    pub fn adoptCredential(e: *Engine, name: []const u8, saved: []const u8) Error!bool {
+        return (try e.ensureServer(try e.find(name))).useCredential(saved);
     }
 
     /// Sends the refresh server `name` said was due.
@@ -446,6 +452,7 @@ pub const Engine = struct {
                     .maybe_ran = c.maybe_ran,
                     .timed_out = c.timed_out,
                     .answer = c.answer,
+                    .oversized = c.oversized,
                 } });
             },
             .input => |q| for (slot.calls.items) |x| if (x.sent != null and x.sent.? == q.handle) {

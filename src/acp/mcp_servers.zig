@@ -560,12 +560,12 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
 
 test "ACP MCP parser handles fuzzed request bytes" {
     try std.testing.fuzz({}, fuzzParse, .{
-        .corpus = &.{
+        .corpus = &(@import("fuzz_seed").slices(.{
             "",
             "{}",
             "{\"mcpServers\":[]}",
             "{\"mcpServers\":[{\"name\":\"fixture\",\"command\":\"/bin/echo\",\"args\":[],\"env\":[]}]}",
             "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"fixture\",\"url\":\"http://localhost:4321/mcp\",\"headers\":[]}]}",
-        },
+        }) ++ @import("fuzz_corpus").acp_mcp_servers.*),
     });
 }

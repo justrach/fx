@@ -61,5 +61,12 @@
       { "config": "UrlRetry.findings.cfg", "invariant": "EndsByUserOrServer" }
     ],
     "repair": []
+  },
+  {
+    "module": "MixedBuilds",
+    "smoke": "MixedBuilds.cfg",
+    "stress": "MixedBuilds.stress.cfg",
+    "findings": [],
+    "repair": []
   }
 ]

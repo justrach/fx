@@ -326,6 +326,27 @@ describe("version-scoped legacy MCP remote transports", () => {
     }, 30_000);
   }
 
+  // fx reads at most 16 MiB of one message. Before, an answer over that was
+  // treated as a broken stream: fx resumed it twice, getting the same answer
+  // each time, then told the model the server went away.
+  test("Streamable HTTP ends a call whose answer is over fx's message limit at once, without resuming it", async () => {
+    streamable = startLegacyStreamableHttpFixture("2025-06-18", { mode: "oversized_resumable" });
+    const root = createRoot("oversized-answer", "http", streamable.url);
+    gateway = startToolGateway("Oversized answer handled.");
+
+    const result = await runAsk(root, gateway, "Call the oversized fixture.");
+
+    expect(result.code).toBe(0);
+    // What the model was told: the call's error text.
+    const told = /MCP server 'fixture' ended the call[^"\\]*/.exec(gateway.requests[2]?.body ?? "")?.[0] ?? "";
+    expect(told).toContain("its reply was larger than fx reads in one message, so fx dropped it");
+    expect(told).not.toContain("the server went away");
+    expect(streamable.requests.filter((entry) => entry.message?.method === "tools/call")).toHaveLength(1);
+    expect(streamable.requests.filter((entry) =>
+      entry.httpMethod === "GET" && entry.headers["last-event-id"] !== undefined
+    )).toHaveLength(0);
+  }, 60_000);
+
   test("Streamable HTTP accepts an omitted session and skips DELETE", async () => {
     streamable = startLegacyStreamableHttpFixture("2025-06-18", {
       session: false,

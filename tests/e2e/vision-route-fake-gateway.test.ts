@@ -1842,6 +1842,52 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
+    "a resumed text-only turn is sent while the catalog is down, with the earlier image withheld",
+    async () => {
+      const root = createIsolatedRoot();
+      const fixture = createScopedImageFixture(root);
+      const imageData = readFileSync(fixture.imagePath).toString("base64");
+      const up = startImageGateway([sseText("It shows a logo.")]);
+      const down = startImageGateway(
+        [sseText("Text turn answered")],
+        undefined,
+        new Response("catalog unavailable", { status: 503 }),
+      );
+      try {
+        const first = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--image", fixture.imagePath, "Describe the attached image."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, up, KIMI_MODEL), timeoutMs: TIMEOUT },
+        );
+        const firstJson = parseFxJson(first);
+        expect(firstJson.exit_code).toBe(0);
+        expect(up.chatRequests[0]!.body).toContain(imageData);
+
+        // The next turn, in a new process, cannot reach the catalog.
+        const resumed = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume-id", firstJson.session_id, "Testing"],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, down, KIMI_MODEL), timeoutMs: TIMEOUT },
+        );
+        const resumedJson = parseFxJson(resumed);
+        expect(resumedJson.exit_code).toBe(0);
+        expect(resumedJson.output).toContain("Text turn answered");
+        expect(down.chatRequests).toHaveLength(1);
+        const body = down.chatRequests[0]!.body;
+        expect(filePartCount(body)).toBe(0);
+        expect(body).not.toContain(imageData);
+        expect(body).not.toContain('"name":"vision"');
+        expect(body).toContain("[Image #1 was not sent with this request: fx could not confirm image input support");
+        expect(resumed.stderr.split("Earlier images aren't reaching the model right now")).toHaveLength(2);
+        expect(resumed.stderr).not.toContain("Unable to verify image support");
+      } finally {
+        up.stop();
+        down.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "Vision outage is an ordinary failed tool result with the exact notice",
     async () => {
       const root = createIsolatedRoot();

@@ -1928,7 +1928,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         @constCast(&.{});
     errdefer if (resolved_provider.len > 0) alloc.free(resolved_provider);
     const session_id = if (ctx.v2) |v2|
-        // A session exists once its first turn is written.
+        // A session exists once its log is on disk (D90).
         try alloc.dupe(u8, if (v2.saved()) v2.id() else "")
     else
         try alloc.dupe(u8, "");
@@ -4300,10 +4300,11 @@ fn testProcessQueuedPromptChecksExecOnlyTerminal(_: *agent_runtime.Agent, deps: 
     const advertised_shell = for (cfg.advertised_functions) |function| {
         if (std.mem.eql(u8, function.name, "shell")) break function;
     } else return error.TestExpectedEqual;
-    try std.testing.expect(model_tool_schema.isSingleRequiredObjectUnionField(
-        advertised_shell.input_schema,
-        "request",
-    ));
+    // The process-only shell is flat and leaves out the terminal fields.
+    try std.testing.expectEqualStrings("action", advertised_shell.input_schema.properties[0].name);
+    for (advertised_shell.input_schema.properties) |property| {
+        try std.testing.expect(!std.mem.eql(u8, property.name, "tty"));
+    }
     try std.testing.expect(std.mem.find(u8, advertised_shell.description, "shell.interact") != null);
     try std.testing.expectEqualStrings(builtin_tools.web_search.description, cfg.custom_tool_guidance);
     try std.testing.expectEqualStrings("test model overlay", cfg.model_prompt_overlay.?);

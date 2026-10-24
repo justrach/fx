@@ -555,6 +555,11 @@ pub const Session = struct {
         return s.inner.readPage(gpa, from, direction, limit);
     }
 
+    /// Whether the session's log is on disk now, so a resume finds it.
+    pub fn onDisk(s: Session) bool {
+        return s.inner.onDisk();
+    }
+
     /// An owned copy of the folded state; free with `State.deinit`.
     pub fn state(s: Session, gpa: std.mem.Allocator) error{OutOfMemory}!State {
         return s.inner.stateCopy(gpa);

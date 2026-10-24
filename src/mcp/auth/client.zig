@@ -73,8 +73,9 @@ pub const Action = union(enum) {
     /// Request `key` ends without a usable token.
     give_up: struct { key: u64, why: core.GiveUp },
     /// Requests need a sign-in: a 401 a refresh can't fix, or a 403 asking for
-    /// more scopes (`step_up`).
-    needs_sign_in: struct { step_up: bool },
+    /// more scopes (`step_up`). `refused` is the refresh that ended the
+    /// login, when one did.
+    needs_sign_in: struct { step_up: bool, refused: ?oauth.Refusal = null },
     /// The host opens this authorization URL; it stays valid until the next
     /// sign-in starts.
     authorize: []const u8,
@@ -170,6 +171,9 @@ pub const Auth = struct {
     refresh_key: u64 = 0,
     /// A refresh waits for the host's answer (`refresh_via_host`).
     refresh_due: bool = false,
+    /// The refresh refusal that ended the login, until a sign-in or a
+    /// restored credential brings another.
+    refusal: ?oauth.Refusal = null,
     /// The revocation a sign-out sent, until its answer: closing waits for it.
     revoke_key: u64 = 0,
     next_key: u64 = fetch_base,
@@ -299,7 +303,7 @@ pub const Auth = struct {
     fn announce(a: *Auth, step_up: bool) Allocator.Error!void {
         if (a.announced) return;
         a.announced = true;
-        try a.actions.append(a.gpa, .{ .needs_sign_in = .{ .step_up = step_up } });
+        try a.actions.append(a.gpa, .{ .needs_sign_in = .{ .step_up = step_up, .refused = if (step_up) null else a.refusal } });
     }
 
     fn startRefresh(a: *Auth) Error!void {
@@ -480,6 +484,10 @@ pub const Auth = struct {
         // Before any sign-in step, as the model's Init.
         a.flow.granted = if (raw[10]) |v| try a.scopes.ofArray(a.keep.allocator(), v) else 0;
         a.flow.challenge = if (raw[11]) |v| try a.scopes.ofArray(a.keep.allocator(), v) else 0;
+        // A new login, as after a sign-in: when it stops working, that is
+        // announced too, with its own reason.
+        a.announced = false;
+        a.refusal = null;
         try a.stepGate(.{ .signed_in = .{ .refreshable = a.refresh_token != null } });
         return true;
     }
@@ -508,6 +516,7 @@ pub const Auth = struct {
             },
             .signed_in => {
                 a.announced = false;
+                a.refusal = null;
                 try a.stepGate(.{ .signed_in = .{ .refreshable = a.refresh_token != null } });
                 try a.actions.append(a.gpa, .signed_in);
             },
@@ -737,8 +746,11 @@ pub const Auth = struct {
             if (a.options.refresh_via_host) try a.actions.append(a.gpa, .refresh_ended);
             return;
         } else |err| if (err == error.OutOfMemory) return error.OutOfMemory;
-        // An answer naming a refusal refuses the refresh token for good.
-        try a.refreshEnded(if (oauth.refusesRefresh(status, body)) .refused else .failed);
+        // An answer naming a refusal refuses the refresh token for good, and
+        // the sign-in it asks for says why.
+        const refusal = oauth.refreshRefusal(status, body);
+        if (refusal) |r| a.refusal = r;
+        try a.refreshEnded(if (refusal != null) .refused else .failed);
     }
 
     /// What a refresh needs comes from the sign-in that brought the tokens.
@@ -969,6 +981,92 @@ test "a refresh the host decides waits for it, and ends however it does: replace
         try testing.expectEqual(@as(u64, 0), a.refresh_key);
         try testing.expectEqual(@as(usize, 0), actions.len);
     }
+}
+
+test "a refused refresh asks for a sign-in naming the refusal, and so does a login taken since when it is refused too" {
+    const testing = std.testing;
+    var client: http.Client = undefined;
+    try client.init(testing.io, testing.allocator, .{ .url = "http://127.0.0.1:9/mcp" });
+    defer client.deinit();
+    var a: Auth = .init(testing.io, testing.allocator, &client, "http://127.0.0.1:9/mcp", .{ .refresh_via_host = true }, null);
+    defer a.deinit();
+    const saved = "{{\"access\":\"{s}\",\"refresh\":\"rt-{s}\",\"expires_at_ms\":4102444800000,\"skew_ms\":30000,\"token_endpoint\":\"http://127.0.0.1:9/token\"," ++
+        "\"revocation_endpoint\":null,\"resource\":\"http://127.0.0.1:9/mcp\",\"client_id\":\"c1\",\"client_secret\":null,\"method\":\"none\"}}";
+    var buffer: [512]u8 = undefined;
+    const actions = &a.actions.items;
+    // Its own login, then one another process saved, taken in its place.
+    for ([_][]const u8{ "at1", "at2" }, [_]u16{ 400, 401 }, [_][]const u8{ "invalid_grant", "invalid_client" }, 0..) |access, status, code, k| {
+        try testing.expect(try a.restore(try std.mem.print(&buffer, saved, .{ access, access })));
+        try testing.expectEqual(@as(?oauth.Refusal, null), a.refusal);
+        const key: u64 = 10 + k;
+        try a.beforeSend(key);
+        _ = try a.ended(key, .{ .rejected = .{ .status = 401, .challenge = "" } });
+        a.actions.clearRetainingCapacity();
+        a.refresh_due = false;
+        a.refresh_key = a.newKey();
+        var answer: [160]u8 = undefined;
+        // The description names a token; only the code and status go on.
+        _ = try a.fetched(a.refresh_key, status, "application/json", null, try std.mem.print(&answer, "{{\"error\":\"{s}\",\"error_description\":\"rt-{s} was used\"}}", .{ code, access }));
+        var asked: usize = 0;
+        for (actions.*) |x| if (x == .needs_sign_in) {
+            asked += 1;
+            try testing.expect(!x.needs_sign_in.step_up);
+            const refused = x.needs_sign_in.refused orelse return error.TestUnexpectedResult;
+            try testing.expectEqual(status, refused.status);
+            try testing.expectEqualStrings(code, refused.code);
+        };
+        try testing.expectEqual(@as(usize, 1), asked);
+        try testing.expectEqual(@as(?[]u8, null), a.access);
+    }
+}
+
+/// A saved credential of any shape: `restore` takes it or returns false, and
+/// a false keeps the credential in use.
+fn fuzzRestore(_: void, smith: *std.testing.Smith) !void {
+    const testing = std.testing;
+    var client: http.Client = undefined;
+    try client.init(testing.io, testing.allocator, .{ .url = "http://127.0.0.1:9/mcp" });
+    defer client.deinit();
+    var a: Auth = .init(testing.io, testing.allocator, &client, "http://127.0.0.1:9/mcp", .{ .refresh_via_host = true }, null);
+    defer a.deinit();
+    try testing.expect(try a.restore("{\"access\":\"at1\",\"refresh\":\"rt\",\"expires_at_ms\":4102444800000,\"skew_ms\":30000,\"token_endpoint\":\"http://127.0.0.1:9/token\",\"revocation_endpoint\":null,\"resource\":\"http://127.0.0.1:9/mcp\",\"client_id\":\"c1\",\"client_secret\":null,\"method\":\"none\"}"));
+    var buffer: [1024]u8 = undefined;
+    const len = smith.sliceWeightedBytes(&buffer, &.{
+        .rangeAtMost(u8, 0x20, 0x7e, 8),
+        .rangeAtMost(u8, 0x00, 0xff, 1),
+        .value(u8, '{', 3),
+        .value(u8, '}', 3),
+        .value(u8, '"', 5),
+        .value(u8, '\\', 2),
+        .value(u8, ':', 3),
+        .value(u8, ',', 3),
+    });
+    const taken = a.restore(buffer[0..len]) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.TestUnexpectedResult,
+    };
+    if (taken) {
+        try testing.expect(oauth.validToken(a.access.?));
+        try testing.expect(a.cred != null);
+    } else {
+        try testing.expectEqualStrings("at1", a.access.?);
+        try testing.expectEqualStrings("http://127.0.0.1:9/token", a.cred.?.token_endpoint);
+    }
+}
+
+test "a saved credential of any shape is taken whole or not at all" {
+    try std.testing.fuzz({}, fuzzRestore, .{
+        .corpus = &.{
+            "",
+            "{}",
+            "not json",
+            "{\"access\":\"at2\"}",
+            "{\"access\":\"at\\r\\n2\",\"method\":\"none\",\"token_endpoint\":\"http://127.0.0.1:9/token\",\"resource\":\"r\",\"client_id\":\"c\"}",
+            "{\"access\":\"at2\",\"refresh\":null,\"expires_at_ms\":\"soon\",\"skew_ms\":-1,\"token_endpoint\":\"http://127.0.0.1:9/token\",\"revocation_endpoint\":null,\"resource\":\"r\",\"client_id\":\"c\",\"client_secret\":null,\"method\":\"none\",\"scope\":[\"a\",7],\"step_up\":{}}",
+            "{\"access\":\"at2\",\"token_endpoint\":\"https://0.0.0.0:1/token\",\"resource\":\"r\",\"client_id\":\"c\",\"method\":\"none\"}",
+            "{\"access\":\"at2\",\"token_endpoint\":\"http://127.0.0.1:9/token\",\"resource\":\"r\",\"client_id\":\"c\",\"method\":\"dpop\"}",
+        },
+    });
 }
 
 test "a request a sign-in is needed for gives up only after the sign-in is announced" {

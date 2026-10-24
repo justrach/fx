@@ -178,7 +178,7 @@ test "the return of this sign-in is the callback address; other requests and ret
     listener.expect(testing.io, authorize_s1);
 
     const Browser = struct {
-        replies: [4][4096]u8 = undefined,
+        replies: [4][16384]u8 = undefined,
         reply: [4][]const u8 = .{ "", "", "", "" },
         fn run(b: *@This(), port: u16) void {
             const targets = [_][]const u8{ "/favicon.ico", "/callback?code=c0&state=s2", "/callback?code=c0", "/callback?code=c1&state=s1" };
@@ -301,7 +301,7 @@ test "a refused sign-in comes back to the failure page; someone else's refusal i
     const Browser = struct {
         stray: [4096]u8 = undefined,
         stray_reply: []const u8 = "",
-        page: [4096]u8 = undefined,
+        page: [16384]u8 = undefined,
         reply: []const u8 = "",
         fn run(b: *@This(), port: u16) void {
             b.stray_reply = get(port, "/callback?error=access_denied&state=s2", &b.stray) catch "";

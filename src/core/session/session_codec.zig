@@ -5951,7 +5951,7 @@ test "an old session's usage field is skipped in its place, and the rest loads" 
 }
 
 test "durable session optional fields handle fuzzed ownership paths" {
-    try std.testing.fuzz({}, fuzzDurableSessionOptionalFields, .{ .corpus = &.{
+    try std.testing.fuzz({}, fuzzDurableSessionOptionalFields, .{ .corpus = &(@import("fuzz_seed").slices(.{
         "{\"id\":\"session\",\"origin_workspace_root\":\"/tmp/origin\",\"workspace_root\":\"/tmp/current\",\"created_at_ms\":1,\"updated_at_ms\":1,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}",
         "{\"id\":\"session\",\"origin_workspace_root\":\"/tmp/origin\",\"workspace_root\":\"/tmp/current\",\"created_at_ms\":1,\"updated_at_ms\":1,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0,\"context_history_start\":0,\"last_subagent_work_id\":\"work\"}",
         "{\"id\":\"session\",\"origin_workspace_root\":\"/tmp/origin\",\"workspace_root\":\"/tmp/current\",\"created_at_ms\":1,\"updated_at_ms\":1,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0,\"last_subagent_work_id\":\"work\",\"context_history_start\":0}",
@@ -5960,17 +5960,17 @@ test "durable session optional fields handle fuzzed ownership paths" {
         "{\"last_subagent_work_id\":null}",
         "{\"usage\":null,\"last_subagent_work_id\":\"work\"}",
         "{\"last_subagent_work_id\":\"work\",\"usage\":null}",
-    } });
+    }) ++ @import("fuzz_corpus").session_optional_fields.*) });
 }
 
 test "per-turn work provenance parser handles fuzzed ownership paths" {
-    try std.testing.fuzz({}, fuzzWorkProvenanceHistoryTurn, .{ .corpus = &.{
+    try std.testing.fuzz({}, fuzzWorkProvenanceHistoryTurn, .{ .corpus = &(@import("fuzz_seed").slices(.{
         "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[],\"work_id\":\"work-1\"},\"assistant\":\"reply\",\"execution\":{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}}",
         "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[]},\"assistant\":\"reply\",\"execution\":{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}}",
         "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[],\"work_id\":\"\"}}",
         "",
         "{}",
-    } });
+    }) ++ @import("fuzz_corpus").session_work_provenance.*) });
 }
 
 fn fuzzWorkProvenanceHistoryTurn(_: void, smith: *std.testing.Smith) !void {

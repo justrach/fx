@@ -151,16 +151,14 @@ fn prepareBrowserSignIn(alloc: Allocator) !PreparedBrowserLogin {
     errdefer if (expected_subject) |value| alloc.free(value);
     const code_challenge = try pkceChallengeAlloc(alloc, code_verifier);
     defer alloc.free(code_challenge);
-    const authorization_url = try buildBrowserAuthorizationUrl(
-        alloc,
-        configured_issuer,
-        redirect_uri,
-        code_challenge,
-        state,
-        nonce,
-        registered_client,
-        host_id,
-    );
+    const authorization_url = try chatgpt_plan.authorizationUrl(alloc, configured_issuer, .{
+        .client_id = registered_client,
+        .host_id = host_id,
+        .redirect_uri = redirect_uri,
+        .challenge = code_challenge,
+        .state = state,
+        .nonce = nonce,
+    });
     var authorization_url_owned = true;
     errdefer if (authorization_url_owned) alloc.free(authorization_url);
 
@@ -710,26 +708,6 @@ const BrowserCallback = struct {
     }
 };
 
-fn buildBrowserAuthorizationUrl(
-    alloc: Allocator,
-    issuer: []const u8,
-    redirect_uri: []const u8,
-    code_challenge: []const u8,
-    state: []const u8,
-    nonce: []const u8,
-    registered_client: []const u8,
-    host_id: []const u8,
-) ![]u8 {
-    return chatgpt_plan.authorizationUrl(alloc, issuer, .{
-        .client_id = registered_client,
-        .host_id = host_id,
-        .redirect_uri = redirect_uri,
-        .challenge = code_challenge,
-        .state = state,
-        .nonce = nonce,
-    });
-}
-
 fn parseBrowserCallbackTarget(
     alloc: Allocator,
     target: []const u8,
@@ -833,16 +811,14 @@ test "Codex refresh uses JSON and accepts omitted token rotation and lifetime" {
 }
 
 test "ChatGPT browser authorization URL uses PKCE without device authentication" {
-    const url = try buildBrowserAuthorizationUrl(
-        std.testing.allocator,
-        "https://auth.openai.com",
-        "http://localhost:1455/auth/callback",
-        "challenge-value",
-        "state-value",
-        "nonce-value",
-        dynamic_client_id,
-        "urn:uuid:00000000-0000-4000-8000-000000000001",
-    );
+    const url = try chatgpt_plan.authorizationUrl(std.testing.allocator, "https://auth.openai.com", .{
+        .client_id = dynamic_client_id,
+        .host_id = "urn:uuid:00000000-0000-4000-8000-000000000001",
+        .redirect_uri = "http://localhost:1455/auth/callback",
+        .challenge = "challenge-value",
+        .state = "state-value",
+        .nonce = "nonce-value",
+    });
     defer std.testing.allocator.free(url);
 
     try std.testing.expect(std.mem.startsWith(u8, url, "https://auth.openai.com/api/accounts/authorize?"));

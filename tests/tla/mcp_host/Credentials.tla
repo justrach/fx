@@ -3,8 +3,10 @@
 \* backend (FX_DISABLE_KEYCHAIN=1; the Keychain backend reads and writes the
 \* same document through native_keychain).
 \*
-\* One document, `~/.fx/mcp-credentials/credentials-v2.json`:
-\*   {"version":2, "servers":[{name,url,credential}]}, version 1 still read
+\* One document, `~/.fx/mcp-credentials/credentials-v3.json`:
+\*   {"version":2, "servers":[{name,url,credential}]}, version 1 still read.
+\* Older builds' `credentials-v2.json` is never read or written here; how
+\* the two stores live side by side is MixedBuilds.tla's.
 \* Every operation holds the directory's advisory lock (Store.lock), so each
 \* is atomic here, and reads the document first (Store.read): a missing file
 \* is empty; one that doesn't parse, or whose version is neither 1 nor 2, is unreadable,

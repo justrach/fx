@@ -16,23 +16,29 @@
 \*     removed and the saved login is still its own.
 \*   - PickUp: a process that needs a login takes the saved one, unless it
 \*     already had or tried it.
-\*   - Logout: a sign-out on purpose removes the saved login, whoever saved it,
-\*     and ends it everywhere.
+\*   - Logout: a sign-out on purpose removes the saved login, whoever saved
+\*     it. Where the server takes revocations (Revocation) it revokes what the
+\*     process holds, and the saved login too when another process saved a
+\*     different one since (`.logout`, Engine.adoptCredential); elsewhere
+\*     nothing ends at the server. The process holds and remembers nothing.
 \*   - Refresh: the access token a process holds runs out. Each refresh token
 \*     works once (WorkOS; RFC 9700 4.14.2): a refresh returns the next version
 \*     and retires the one sent, and the server refuses a retired one sent
 \*     again; with RevokeOnReplay that also stops every version of its chain.
 \*     Under the login's refresh lock, so one process refreshes at a time, a
 \*     process takes a newer saved login if there is one, and refreshes only
-\*     if not. With SaveFaults the save of what it got may fail: it keeps
-\*     using it, and the saved login it had stays its own.
+\*     if not. With no saved login at all where it had one, another process
+\*     logged out: it signs out too, rather than saving its refresh back.
+\*     With SaveFaults the save of what it got may fail: it keeps using it,
+\*     and the saved login it had stays its own.
 EXTENDS Naturals
 
 CONSTANTS
     Procs,          \* fx processes sharing the store
     MaxVer,         \* sign-ins and refreshes per run
     RevokeOnReplay, \* a retired version sent again stops its whole chain
-    SaveFaults      \* a refresh's save may fail
+    SaveFaults,     \* a refresh's save may fail
+    Revocation      \* the server takes revocations
 
 Vers == 1..MaxVer
 
@@ -45,13 +51,17 @@ VARIABLES
     next,     \* the next version, by sign-in or refresh
     dead,     \* the versions the server no longer takes
     chain,    \* [Vers -> the sign-in each version descends from, 0 if unused]
+    out,      \* the user logged out, and nobody signed in since
     \* Ghosts.
     erased,   \* a refusal removed a newer login another process saved
     retook,   \* a process took a version it had or tried before
     replayed, \* a process sent a retired version while a later one was saved
-    stale     \* a refusal left saved an older version the process had refreshed away
+    stale,    \* a refusal left saved an older version the process had refreshed away
+    resurrected, \* a refresh saved a login while the user's logout stood
+    leftValid    \* a logout left the saved login valid at a server that revokes
 
-vars == <<store, held, tried, needs, unsaved, next, dead, chain, erased, retook, replayed, stale>>
+vars == <<store, held, tried, needs, unsaved, next, dead, chain, out, erased, retook, replayed, stale, resurrected, leftValid>>
+ghosts == <<erased, retook, replayed, stale, resurrected, leftValid>>
 
 TypeOK ==
     /\ store \in 0..MaxVer
@@ -62,7 +72,9 @@ TypeOK ==
     /\ next \in 1..(MaxVer + 1)
     /\ dead \subseteq Vers
     /\ chain \in [Vers -> 0..MaxVer]
+    /\ out \in BOOLEAN
     /\ erased \in BOOLEAN /\ retook \in BOOLEAN /\ replayed \in BOOLEAN /\ stale \in BOOLEAN
+    /\ resurrected \in BOOLEAN /\ leftValid \in BOOLEAN
 
 Init ==
     /\ store = 0
@@ -73,7 +85,9 @@ Init ==
     /\ next = 1
     /\ dead = {}
     /\ chain = [v \in Vers |-> 0]
+    /\ out = FALSE
     /\ erased = FALSE /\ retook = FALSE /\ replayed = FALSE /\ stale = FALSE
+    /\ resurrected = FALSE /\ leftValid = FALSE
 
 SignIn(p) ==
     /\ next <= MaxVer
@@ -84,7 +98,8 @@ SignIn(p) ==
     /\ unsaved' = [unsaved EXCEPT ![p] = FALSE]
     /\ next' = next + 1
     /\ chain' = [chain EXCEPT ![next] = next]
-    /\ UNCHANGED <<dead, erased, retook, replayed, stale>>
+    /\ out' = FALSE
+    /\ UNCHANGED <<dead, erased, retook, replayed, stale, resurrected, leftValid>>
 
 \* p's tokens drop and it needs a login; it removes the saved login only if
 \* that is its own.
@@ -100,13 +115,14 @@ Refused(p) ==
     /\ held[p] # 0
     /\ dead' = dead \cup {held[p]}
     /\ Drop(p)
-    /\ UNCHANGED <<tried, next, chain, retook, replayed>>
+    /\ UNCHANGED <<tried, next, chain, out, retook, replayed, resurrected, leftValid>>
 
 NeedsScope(p) ==
     /\ held[p] # 0
     /\ ~needs[p]
     /\ needs' = [needs EXCEPT ![p] = TRUE]
-    /\ UNCHANGED <<store, held, tried, unsaved, next, dead, chain, erased, retook, replayed, stale>>
+    /\ UNCHANGED <<store, held, tried, unsaved, next, dead, chain, out>>
+    /\ UNCHANGED ghosts
 
 PickUp(p) ==
     /\ needs[p]
@@ -117,15 +133,18 @@ PickUp(p) ==
     /\ needs' = [needs EXCEPT ![p] = FALSE]
     /\ unsaved' = [unsaved EXCEPT ![p] = FALSE]
     /\ retook' = (retook \/ store = tried[p])
-    /\ UNCHANGED <<store, next, dead, chain, erased, replayed, stale>>
+    /\ UNCHANGED <<store, next, dead, chain, out, erased, replayed, stale, resurrected, leftValid>>
 
 Logout(p) ==
-    /\ held[p] # 0
     /\ held' = [held EXCEPT ![p] = 0]
+    /\ tried' = [tried EXCEPT ![p] = 0]
+    /\ needs' = [needs EXCEPT ![p] = TRUE]
     /\ unsaved' = [unsaved EXCEPT ![p] = FALSE]
     /\ store' = 0
-    /\ dead' = {w \in Vers : chain[w] # 0}
-    /\ UNCHANGED <<tried, needs, next, chain, erased, retook, replayed, stale>>
+    /\ out' = TRUE
+    /\ dead' = IF Revocation THEN dead \cup ({held[p], store} \ {0}) ELSE dead
+    /\ leftValid' = (leftValid \/ (Revocation /\ store # 0 /\ store \notin dead'))
+    /\ UNCHANGED <<next, chain, erased, retook, replayed, stale, resurrected>>
 
 \* Another process saved a login this one hasn't had or tried.
 Newer(p) == store # 0 /\ store # tried[p]
@@ -136,7 +155,7 @@ Take(p) ==
     /\ tried' = [tried EXCEPT ![p] = store]
     /\ unsaved' = [unsaved EXCEPT ![p] = FALSE]
     /\ retook' = (retook \/ store = tried[p])
-    /\ UNCHANGED <<store, needs, next, dead, chain, erased, replayed, stale>>
+    /\ UNCHANGED <<store, needs, next, dead, chain, out, erased, replayed, stale, resurrected, leftValid>>
 
 \* The saved login is a later version of v's chain, so sending v was avoidable.
 SavedLater(v) == store # 0 /\ chain[store] = chain[v] /\ store > v
@@ -155,20 +174,38 @@ Send(p) ==
          /\ \/ /\ store' = next
                /\ tried' = [tried EXCEPT ![p] = next]
                /\ unsaved' = [unsaved EXCEPT ![p] = FALSE]
+               /\ resurrected' = (resurrected \/ out)
             \/ /\ SaveFaults
                /\ unsaved' = [unsaved EXCEPT ![p] = TRUE]
-               /\ UNCHANGED <<store, tried>>
-         /\ UNCHANGED <<needs, erased, retook, replayed, stale>>
+               /\ UNCHANGED <<store, tried, resurrected>>
+         /\ UNCHANGED <<needs, out, erased, retook, replayed, stale, leftValid>>
     ELSE /\ replayed' = (replayed \/ SavedLater(v))
          /\ dead' = IF RevokeOnReplay THEN dead \cup {w \in Vers : chain[w] = chain[v]} ELSE dead
          /\ Drop(p)
-         /\ UNCHANGED <<tried, next, chain, retook>>
+         /\ UNCHANGED <<tried, next, chain, out, retook, resurrected, leftValid>>
 
-\* Under the login's refresh lock: a newer saved login if there is one, else
-\* a refresh.
+\* No saved login where p had one: another process logged out of it, or
+\* removed the server.
+EndedElsewhere(p) == store = 0 /\ tried[p] # 0
+
+\* p signs out too: it revokes what it holds where the server takes
+\* revocations, and saves nothing (`tryRefresh`).
+SignOutToo(p) ==
+    /\ held' = [held EXCEPT ![p] = 0]
+    /\ tried' = [tried EXCEPT ![p] = 0]
+    /\ needs' = [needs EXCEPT ![p] = TRUE]
+    /\ unsaved' = [unsaved EXCEPT ![p] = FALSE]
+    /\ dead' = IF Revocation THEN dead \cup {held[p]} ELSE dead
+    /\ UNCHANGED <<store, next, chain, out>>
+    /\ UNCHANGED ghosts
+
+\* Under the login's refresh lock: a newer saved login if there is one; none
+\* where p had one, and p signs out; else a refresh.
 Refresh(p) ==
     /\ held[p] # 0 /\ ~needs[p]
-    /\ IF Newer(p) THEN Take(p) ELSE Send(p)
+    /\ IF Newer(p) THEN Take(p)
+       ELSE IF EndedElsewhere(p) THEN SignOutToo(p)
+       ELSE Send(p)
 
 \* Nothing happens: a run may end anywhere, so no state is a deadlock.
 Idle == UNCHANGED vars
@@ -198,4 +235,11 @@ NoRetiredRefresh == ~replayed
 \* A refused process never leaves saved a version it had refreshed away, so
 \* nothing takes that one later.
 NoStaleLoginLeft == ~stale
+
+\* Once the user logs out, no refresh saves a login again until someone
+\* signs in.
+LogoutStays == ~resurrected
+
+\* A logout leaves no saved login valid at a server that takes revocations.
+LogoutRevokesSaved == ~leftValid
 ====

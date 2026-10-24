@@ -30,6 +30,8 @@ pub const Event = union(enum) {
     http_failure,
     /// The connection or stream broke before the answer.
     stream_broken,
+    /// The answer was over the message limit (HTTP-14).
+    too_large,
     /// The re-list after -32020 ended, well or not.
     relisted: bool,
     /// The host cancelled, or the request's timeout fired.
@@ -127,6 +129,13 @@ pub const Exchange = struct {
             },
             .http_failure => if (x.phase == .posted) x.finish(.failed, .http_failure, out) else {
                 ignored = true;
+            },
+            // Another attempt would only bring the same answer: lost at once.
+            .too_large => if (x.phase != .posted) {
+                ignored = true;
+            } else {
+                x.maybe_ran = x.kind == .call;
+                x.finish(.lost, .lost, out);
             },
             .stream_broken => if (x.phase != .posted) {
                 ignored = true;
@@ -233,7 +242,7 @@ const World = struct {
 const moves = [_]Event{
     .send,         .{ .answer = .result }, .{ .answer = .failure }, .{ .answer = .mismatch },
     .http_failure, .stream_broken,         .{ .relisted = true },   .{ .relisted = false },
-    .cancel,
+    .cancel,       .too_large,
 };
 
 fn apply(x: *Exchange, w: *World, event: Event) !void {
@@ -246,7 +255,7 @@ fn apply(x: *Exchange, w: *World, event: Event) !void {
         try testing.expectEqual(@as(usize, 0), out.effect_count);
         return;
     }
-    if (event == .stream_broken or event == .answer or event == .http_failure) w.posted = false;
+    if (event == .stream_broken or event == .too_large or event == .answer or event == .http_failure) w.posted = false;
     if (event == .relisted) w.relisting = false;
     for (out.effects()) |effect| switch (effect) {
         .post => {
@@ -285,6 +294,8 @@ fn apply(x: *Exchange, w: *World, event: Event) !void {
     if (event == .answer) try testing.expect(w.closed);
     // Where the model has no choice, the core must act.
     if (event == .stream_broken and before.phase == .posted and x.kind == .call) try testing.expectEqual(Phase.lost, x.phase);
+    // TooLargeEnds: an answer over the limit is never asked for again.
+    if (event == .too_large and before.phase == .posted) try testing.expectEqual(Phase.lost, x.phase);
     if (event == .cancel) try testing.expect(x.phase == .cancelled);
     if (event == .relisted and !event.relisted) try testing.expectEqual(Phase.done, x.phase);
 }
@@ -345,6 +356,19 @@ test "a listing is re-issued once after a broken stream; a call is lost, maybe r
     var call: Exchange = .init(.{}, .call);
     call.step(.send, &out);
     call.step(.stream_broken, &out);
+    try testing.expectEqualSlices(Effect, &.{.{ .deliver = .{ .outcome = .lost, .maybe_ran = true } }}, out.effects());
+}
+
+test "an answer over the message limit is lost at once: a listing isn't re-issued, and a call may have run" {
+    var list: Exchange = .init(.{}, .idempotent);
+    var out: Output = .{};
+    list.step(.send, &out);
+    list.step(.too_large, &out);
+    try testing.expectEqualSlices(Effect, &.{.{ .deliver = .{ .outcome = .lost, .maybe_ran = false } }}, out.effects());
+
+    var call: Exchange = .init(.{}, .call);
+    call.step(.send, &out);
+    call.step(.too_large, &out);
     try testing.expectEqualSlices(Effect, &.{.{ .deliver = .{ .outcome = .lost, .maybe_ran = true } }}, out.effects());
 }
 

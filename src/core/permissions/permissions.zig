@@ -71,17 +71,6 @@ pub const PermissionEngine = struct {
     pub fn formatPermissionsText(self: PermissionEngine, alloc: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
         return formatPermissionsStatus(alloc, workspace_root, self.mode, self.grants.items, self.rules);
     }
-
-    pub fn formatPermissionsNoticeBody(self: PermissionEngine, alloc: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
-        const live = try liveSessionGrants(alloc, self.grants.items);
-        defer alloc.free(live);
-        return (output_contracts.PermissionsSnapshot{
-            .workspace_root = workspace_root,
-            .mode = self.mode,
-            .grants = live,
-            .rules = self.rules,
-        }).renderInteractiveBody(alloc);
-    }
 };
 
 pub const RuleDecision = types.RuleDecision;
@@ -1444,7 +1433,7 @@ pub fn liveSessionGrantCount(grants: []const types.PermissionGrant) usize {
 
 /// Copies the grants that still apply, for display. Caller frees the slice;
 /// the grant strings stay borrowed.
-fn liveSessionGrants(alloc: std.mem.Allocator, grants: []const types.PermissionGrant) ![]types.PermissionGrant {
+pub fn liveSessionGrants(alloc: std.mem.Allocator, grants: []const types.PermissionGrant) ![]types.PermissionGrant {
     var live: std.ArrayList(types.PermissionGrant) = .empty;
     errdefer live.deinit(alloc);
     for (grants) |grant| {

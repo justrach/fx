@@ -37,8 +37,11 @@ pub const Ending = enum {
     accepted,
     /// A status with no JSON-RPC message in the body.
     http_failure,
-    /// The connection or stream broke, or a message was over the limit.
+    /// The connection or stream broke.
     broken,
+    /// A message was over `max_message`, so the rest of the stream was left
+    /// unread. Asking for it again would bring the same message.
+    too_large,
     /// 401, or 403 with a `WWW-Authenticate` challenge: the server
     /// didn't take the request.
     rejected,
@@ -459,7 +462,8 @@ pub const Client = struct {
         }
         c.readBody(reader, &read, &answer) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
-            error.TooLong, error.ReadFailed, error.OutOfMemory => return .{ .status = status, .how = .broken },
+            error.TooLong => return .{ .status = status, .how = .too_large },
+            error.ReadFailed, error.OutOfMemory => return .{ .status = status, .how = .broken },
         };
         if (wire.decode(answer.items)) |message| {
             // A result says it worked, so one under an error status
@@ -589,7 +593,7 @@ pub const Client = struct {
                 error.Canceled => return error.Canceled,
                 error.ReadFailed, error.OutOfMemory => return .{ .status = status, .how = .broken },
             };
-            if (got.too_long) return .{ .status = status, .how = .broken };
+            if (got.too_long) return .{ .status = status, .how = .too_large };
             const event = parser.line(c.gpa, &data, mark) catch return .{ .status = status, .how = .broken };
             if (event) |e| {
                 const event_id: ?[]u8 = if (e.id) |i| c.gpa.dupe(u8, i) catch return .{ .status = status, .how = .broken } else null;
@@ -707,6 +711,49 @@ fn serveEvents(server: *Io.net.Server, count: usize) !void {
     for (0..count) |_| try w.interface.writeAll("data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/n\"}\n\n");
     try w.interface.writeAll("data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n");
     try w.interface.flush();
+}
+
+/// Answers one request on `server` with `body` as `content_type`, and closes.
+fn serveBody(server: *Io.net.Server, content_type: []const u8, body: []const u8) !void {
+    const stream = try server.accept(testing.io);
+    defer stream.close(testing.io);
+    var in: [4096]u8 = undefined;
+    var r = stream.reader(testing.io, &in);
+    while ((try r.interface.takeDelimiterInclusive('\n')).len > 2) {}
+    var out: [1024]u8 = undefined;
+    var w = stream.writer(testing.io, &out);
+    try w.interface.print("HTTP/1.1 200 OK\r\ncontent-type: {s}\r\nconnection: close\r\n\r\n", .{content_type});
+    try w.interface.writeAll(body);
+    try w.interface.flush();
+}
+
+test "an answer over max_message ends too_large, not broken, in a JSON body and in an SSE event" {
+    const pad: [200]u8 = @splat('x');
+    const json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"t\":\"" ++ pad ++ "\"}}";
+    const Case = struct { content_type: []const u8, body: []const u8 };
+    for ([_]Case{
+        .{ .content_type = "application/json", .body = json },
+        .{ .content_type = "text/event-stream", .body = "id: e1\ndata: " ++ json ++ "\n\n" },
+    }) |case| {
+        var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        var server = try address.listen(testing.io, .{ .reuse_address = true });
+        defer server.deinit(testing.io);
+        var serving = try testing.io.concurrent(serveBody, .{ &server, case.content_type, case.body });
+        defer serving.cancel(testing.io) catch {};
+        var url: [64]u8 = undefined;
+        var c: Client = undefined;
+        try c.init(testing.io, testing.allocator, .{ .url = try std.mem.print(&url, "http://127.0.0.1:{d}/mcp", .{server.socket.address.getPort()}), .max_message = 64 });
+        defer c.deinit();
+        try c.send(1, .post, "{}", &.{});
+        while (true) switch (try c.next(5_000)) {
+            .ended => |e| {
+                try testing.expectEqual(Ending.too_large, e.how);
+                break;
+            },
+            .timeout => return error.TestTimeout,
+            else => {},
+        };
+    }
 }
 
 test "events past the budget all arrive, each once the one before it is taken" {

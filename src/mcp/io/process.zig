@@ -153,7 +153,8 @@ pub const Incoming = union(enum) {
     dropped: struct { err: wire.DecodeError, line: []const u8 },
     /// The connection changed state. `lost` means the process is gone and
     /// requests in flight on it are lost (`transport_lost` in `core/request.zig`).
-    changed: struct { state: core.State, lost: bool },
+    /// `oversized` says fx killed it for a stdout line over `max_line`.
+    changed: struct { state: core.State, lost: bool, oversized: bool = false },
     /// `next` was given a timeout and it passed first.
     timeout,
 };
@@ -271,6 +272,9 @@ pub const Process = struct {
     budget: Budget,
     /// Why the last start failed, for logs.
     spawn_error: ?SpawnError = null,
+    /// The current process is being killed because it wrote a stdout line
+    /// over `max_line`: the loss its exit reports is said to be that.
+    killed_oversized: bool = false,
     /// How the last process ended, once it has: set under `pid_lock` before
     /// `.exited` is posted. A status can be read before the owner takes that
     /// event, so read it with `exitStatus`.
@@ -404,13 +408,19 @@ pub const Process = struct {
                 p.held = bytes;
                 return .{ .stderr = bytes };
             },
-            .oversized => |g| (try p.apply(.{ .oversized_line = g })).lost,
+            .oversized => |g| blk: {
+                const applied = try p.apply(.{ .oversized_line = g });
+                if (before == .running and p.conn.state == .killing) p.killed_oversized = true;
+                break :blk applied.lost;
+            },
             .exited => |g| (try p.apply(.{ .process_exited = g })).lost,
             .timer => |t| (try p.apply(.{ .timer_fired = t })).lost,
             // One from an earlier process is stale.
             .write_failed => |g| if (g == p.conn.generation) (try p.apply(.write_failed)).lost else false,
         };
-        if (lost or p.conn.state != before) return .{ .changed = .{ .state = p.conn.state, .lost = lost } };
+        const oversized = lost and p.killed_oversized;
+        if (lost) p.killed_oversized = false;
+        if (lost or p.conn.state != before) return .{ .changed = .{ .state = p.conn.state, .lost = lost, .oversized = oversized } };
         return null;
     }
 
@@ -436,6 +446,7 @@ pub const Process = struct {
             for (out.effects()) |effect| switch (effect) {
                 .spawn => |g| {
                     p.spawn_error = null;
+                    p.killed_oversized = false;
                     p.pid_lock.lockUncancelable(p.io);
                     p.exit = null;
                     p.pid_lock.unlock(p.io);
@@ -978,6 +989,33 @@ test "an oversized line kills the server" {
     try expectState(&p, .killing);
     try expectState(&p, .backoff);
     try testing.expect(p.conn.errored and !p.conn.term_sent);
+}
+
+test "the loss from killing a server for an oversized line says so, and an ordinary exit's doesn't" {
+    const big = shell("printf '%0100d\\n' 0; exec cat >/dev/null");
+    var p: Process = undefined;
+    initTest(&p, &big);
+    defer p.deinit();
+    try p.start();
+    const lost = for (0..200) |_| switch (try p.next(5_000)) {
+        .changed => |c| if (c.lost) break c,
+        .timeout => return error.TestTimeout,
+        else => {},
+    } else return error.TestUnexpectedResult;
+    try testing.expect(lost.oversized);
+    try testing.expect(!p.killed_oversized);
+
+    const quits = shell("exit 3");
+    var q: Process = undefined;
+    initTest(&q, &quits);
+    defer q.deinit();
+    try q.start();
+    const gone = for (0..200) |_| switch (try q.next(5_000)) {
+        .changed => |c| if (c.lost) break c,
+        .timeout => return error.TestTimeout,
+        else => {},
+    } else return error.TestUnexpectedResult;
+    try testing.expect(!gone.oversized);
 }
 
 test "stderr lines reach the host and never change the state" {

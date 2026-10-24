@@ -332,19 +332,24 @@ pub fn tokenFailure(a: Allocator, status: u16, raw: []const u8) Allocator.Error!
 /// client the server no longer accepts, and Slack's for a dead refresh token.
 const refresh_refusals = [_][]const u8{ "invalid_grant", "invalid_client", "unauthorized_client", "invalid_refresh_token" };
 
+/// A refresh the token endpoint refused for good: its HTTP status and the
+/// error it named. `code` is one of `refresh_refusals`, never the server's
+/// own bytes, so it can be logged anywhere.
+pub const Refusal = struct { status: u16, code: []const u8 };
+
 /// Whether a token endpoint's answer to a refresh refuses it for good, so
 /// the refresh token is dropped: an answer at 200 or a 4xx other than 429
 /// that names one of `refresh_refusals`. RFC 6749 sends its errors with 400
 /// or 401, and Slack sends its own with 200 and `ok:false`. Any other error,
 /// such as Slack's `internal_error`, a 429, a 5xx, or an answer naming no
-/// error may pass on a retry, so the tokens stay.
-pub fn refusesRefresh(status: u16, raw: []const u8) bool {
-    if (status != 200 and (status < 400 or status >= 500 or status == 429)) return false;
+/// error may pass on a retry, so the tokens stay: null.
+pub fn refreshRefusal(status: u16, raw: []const u8) ?Refusal {
+    if (status != 200 and (status < 400 or status >= 500 or status == 429)) return null;
     var f: [1]?[]const u8 = undefined;
-    wire.objectFields(raw, &.{"error"}, &f) catch return false;
-    const code = wire.plainString(f[0] orelse return false) orelse return false;
-    for (refresh_refusals) |refusal| if (std.mem.eql(u8, code, refusal)) return true;
-    return false;
+    wire.objectFields(raw, &.{"error"}, &f) catch return null;
+    const code = wire.plainString(f[0] orelse return null) orelse return null;
+    for (refresh_refusals) |refusal| if (std.mem.eql(u8, code, refusal)) return .{ .status = status, .code = refusal };
+    return null;
 }
 
 // ---- Scopes ----
@@ -538,29 +543,36 @@ test "token responses: Bearer only, refresh and expiry optional" {
 }
 
 test "a refresh answer refuses it only for a grant, client or token the server won't take, at 200 or a 4xx other than 429" {
-    try testing.expect(refusesRefresh(400, "{\"error\":\"invalid_grant\"}"));
-    try testing.expect(refusesRefresh(401, "{\"error\":\"invalid_client\"}"));
-    try testing.expect(refusesRefresh(400, "{\"error\":\"unauthorized_client\"}"));
+    try testing.expect(refreshRefusal(400, "{\"error\":\"invalid_grant\"}") != null);
+    try testing.expect(refreshRefusal(401, "{\"error\":\"invalid_client\"}") != null);
+    try testing.expect(refreshRefusal(400, "{\"error\":\"unauthorized_client\"}") != null);
     // Slack's refusal: HTTP 200 with ok:false.
-    try testing.expect(refusesRefresh(200, "{\"ok\":false,\"error\":\"invalid_refresh_token\"}"));
+    try testing.expect(refreshRefusal(200, "{\"ok\":false,\"error\":\"invalid_refresh_token\"}") != null);
     // Slack's errors that pass on a retry keep the tokens.
     for ([_][]const u8{ "internal_error", "service_unavailable", "request_timeout", "fatal_error", "bad_client_secret" }) |code| {
         var buf: [96]u8 = undefined;
         const body = try std.mem.print(&buf, "{{\"ok\":false,\"error\":\"{s}\"}}", .{code});
-        try testing.expect(!refusesRefresh(200, body));
+        try testing.expect(refreshRefusal(200, body) == null);
     }
-    try testing.expect(!refusesRefresh(400, "{\"error\":\"invalid_request\"}"));
-    try testing.expect(!refusesRefresh(400, "{\"error\":\"temporarily_unavailable\"}"));
+    try testing.expect(refreshRefusal(400, "{\"error\":\"invalid_request\"}") == null);
+    try testing.expect(refreshRefusal(400, "{\"error\":\"temporarily_unavailable\"}") == null);
     // Passing: rate limited, unavailable, or nothing named.
-    try testing.expect(!refusesRefresh(429, "{\"error\":\"slow_down\"}"));
+    try testing.expect(refreshRefusal(429, "{\"error\":\"slow_down\"}") == null);
     // A 429 may pass later, whatever it names.
-    try testing.expect(!refusesRefresh(429, "{\"error\":\"invalid_grant\"}"));
-    try testing.expect(!refusesRefresh(503, "{\"error\":\"temporarily_unavailable\"}"));
-    try testing.expect(!refusesRefresh(302, "{\"error\":\"invalid_grant\"}"));
-    try testing.expect(!refusesRefresh(400, "not json"));
-    try testing.expect(!refusesRefresh(200, "{\"ok\":false}"));
-    try testing.expect(!refusesRefresh(400, "{\"error\":\"\"}"));
-    try testing.expect(!refusesRefresh(400, "{\"error\":7}"));
+    try testing.expect(refreshRefusal(429, "{\"error\":\"invalid_grant\"}") == null);
+    try testing.expect(refreshRefusal(503, "{\"error\":\"temporarily_unavailable\"}") == null);
+    try testing.expect(refreshRefusal(302, "{\"error\":\"invalid_grant\"}") == null);
+    try testing.expect(refreshRefusal(400, "not json") == null);
+    try testing.expect(refreshRefusal(200, "{\"ok\":false}") == null);
+    try testing.expect(refreshRefusal(400, "{\"error\":\"\"}") == null);
+    try testing.expect(refreshRefusal(400, "{\"error\":7}") == null);
+    // What it names is fx's own copy of the code, with the status: the
+    // server's bytes never travel further.
+    const body = "{\"error\":\"invalid_grant\",\"error_description\":\"Bearer at-secret\"}";
+    const refusal = refreshRefusal(400, body).?;
+    try testing.expectEqual(@as(u16, 400), refusal.status);
+    try testing.expectEqualStrings("invalid_grant", refusal.code);
+    try testing.expect(@intFromPtr(refusal.code.ptr) < @intFromPtr(body.ptr) or @intFromPtr(refusal.code.ptr) >= @intFromPtr(body.ptr) + body.len);
 }
 
 test "scope sets as bits, with offline_access added once" {

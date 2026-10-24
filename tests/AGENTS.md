@@ -16,6 +16,7 @@ Pick the lowest layer that proves the behavior, and extend the closest existing 
 | fx against the official MCP client conformance suite | `tests/e2e/conformance/`, an isolated npm project |
 | Evidence tooling for terminal rendering bugs | `tests/e2e/render-lab/` |
 | Task quality or tool choice with real models | `tests/evals/` |
+| Saved inputs for a fuzz test | `tests/fuzz/corpus/<target>/`, with the target listed in `tests/fuzz/targets.json` |
 | A protocol or crash-safety design, checked with TLC | A folder under `tests/tla/` named after the module it models |
 | libfx SDK behavior | `sdk/tests/`, which `sdk/AGENTS.md` owns |
 | Startup latency or memory | `benchmarks/` |
@@ -34,6 +35,9 @@ tests/
 ├── fixtures/
 │   └── v1-sessions/       sessions the v0.0.14 release saved, which the converter's tests copy;
 │                          generate.ts rebuilds them and manifest.json lists them
+├── fuzz/
+│   ├── targets.json       every fuzz test, for zig build fuzz and the nightly Fuzz workflow
+│   └── corpus/<target>/   saved inputs that zig build test replays; CONTRIBUTING.md explains them
 └── tla/                   TLA+ models, their checkers, and their Bun drivers
     ├── session_manager/   one folder per model area, named after the module it describes,
     ├── mcp/               each with a check.sh; tla/README.md lists them all

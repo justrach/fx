@@ -98,6 +98,33 @@ fx prints into your terminal's scrollback instead of taking over the screen, so 
 
 When a tmux test or a tape exposes a bug, reproduce it as a Zig unit test before you fix it, so the fix lands with its regression test.
 
+### Fuzz a parser
+
+A fuzz test is a `test` block that calls `std.testing.fuzz`. `tests/fuzz/targets.json` lists each one as a target, with its exact test name and the module that holds it. `zig build test` runs every fuzz test once on its inline seeds and on each file in `tests/fuzz/corpus/<target>/`. `zig build fuzz` builds only the fuzz tests, and with `--fuzz` Zig searches for new inputs that fail:
+
+```bash
+zig build fuzz -Dfuzz-target=sse_framing               # replay the saved inputs
+zig build fuzz -Dfuzz-target=sse_framing --fuzz=200K   # try 200,000 new inputs
+```
+
+When the search finds a failure, Zig 0.17 prints `error: test '...'` but still exits with status 0, so read the output. Without a limit, `--fuzz` runs until you stop it and opens Zig's web interface.
+
+The Fuzz workflow fuzzes each target on `main` every night for about 20 minutes, and for two minutes on a pull request that changes the fuzzing setup. When the nightly run finds a failure, it uploads the failing input as an artifact and opens an issue titled `Nightly fuzz failure: <target>`, or comments on that issue if it is already open. To fix the failure, copy the input into `tests/fuzz/corpus/<target>/` and run `zig build fuzz -Dfuzz-target=<target>` to reproduce it. That build uses Debug by default, which adds allocation stack traces to leak reports. Keep the input file in the fix's pull request, so `zig build test` replays it on every pull request after that.
+
+A saved input holds the values the test reads from its `std.testing.Smith`, in order. For example, a test that calls `smith.slice` reads a 4-byte little-endian length and then that many bytes. Inputs that the fuzzer saves are already in this form. Inline seeds go through `@import("fuzz_seed").slices`, which writes each one in this form for a test whose first read is `smith.slice`. A seed written as a plain string would lose its first four bytes to the length.
+
+To add a target, write the fuzz test in the file it covers and add an entry to `tests/fuzz/targets.json`. For a target outside the session manager, also import its file in `src/fuzz_targets.zig`. Pass the seeds and saved inputs to the test with `.corpus = &(@import("fuzz_seed").slices(.{ <seeds> }) ++ @import("fuzz_corpus").<target>.*)`. The session manager imports nothing from fx, so its targets keep their seeds as files in `tests/fuzz/corpus/<target>/` and pass `.corpus = &(.{""} ++ @import("build_options").fuzz_corpus_<target>.*)`. Set `iterations` so that one round of `--fuzz` takes about 30 seconds on a developer machine. `scripts/tests/test_fuzz_nightly.py` fails when an entry names a test that doesn't exist or that `zig build fuzz` can't reach. The MCP engine in `src/mcp/` imports only the standard library, so its targets live in `src/core/mcp_host/wire_tests.zig`. A file that holds only tests, like that one, is also imported from the test block in `src/main.zig`.
+
+### Find data races
+
+`-Dsanitize-thread=true` builds fx and its tests with ThreadSanitizer, which reports two threads touching the same memory without synchronization. The build is slow and large, so install it to its own prefix:
+
+```bash
+TSAN_OPTIONS=halt_on_error=0:abort_on_error=0 zig build test -Dsanitize-thread=true -p /tmp/fx-tsan
+```
+
+Without those options, the sanitizer aborts a test binary once it has reported a race, so that binary's later tests don't run. The Thread Sanitizer workflow runs the unit tests this way on `main` every night and lists each race in its job summary. It reports races without failing. A sanitized suite runs slower, so a few tests that depend on timing fail in it, such as the `command_runner` tests of output read after a command exits. Those failures aren't races.
+
 ### Check startup performance
 
 The `Startup Latency` check fails a pull request when any benchmarked command takes longer than 2 ms on the Linux CI runner. To measure before you push, run:
@@ -197,6 +224,8 @@ Other runs start only on request:
 | Live ACP suite | `gh workflow run ci.yml --ref your-branch -f acp_live=true` |
 | Long-turn memory benchmark | `gh workflow run bench.yml --ref your-branch -f long_turn_memory=true` |
 | libfx runtime benchmark | `gh workflow run bench.yml --ref your-branch -f libfx_runtime=true` |
+| Fuzzing of one target | `gh workflow run fuzz.yml --ref your-branch -f target=<target>` |
+| Unit tests with ThreadSanitizer | `gh workflow run tsan.yml --ref your-branch` |
 
 Only maintainers can start these runs or add the `ci:macos` label. If you're an outside contributor and your change needs one of them, ask in the pull request and a maintainer will start it. If CI doesn't start at all on your first pull request, a maintainer may need to approve the workflow run.
 

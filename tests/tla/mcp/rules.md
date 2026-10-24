@@ -78,6 +78,7 @@ drivers in `../drivers/mcp/` cite.
 | HTTP-11 | INFO | Ignore SSE comment lines starting with `:` | `2026-07-28_basic_transports_streamable-http` §Receiving Messages | U06 |
 | HTTP-12 | INFO | A 403 for a bad `Origin` is not an auth problem. A 404 with `-32601` means the method isn't implemented | `2026-07-28_basic_transports_streamable-http` §Security, §Protocol Version Header | U06, U09 |
 | HTTP-13 | INFO | Close a request's stream once its final answer is in, even when the server leaves it open: nothing more comes for it, and an open one holds a connection | `2026-07-28_basic_transports_streamable-http` §Receiving Messages ("The final JSON-RPC response SHOULD terminate the stream") | U06 |
+| HTTP-14 | INFO | An answer over the client's message limit ends the request lost at once. Re-issuing it (HTTP-09) would bring the same answer, so it isn't; a `tools/call` may have run | `2026-07-28_basic_transports_streamable-http` §Receiving Messages (re-issuing is for a stream that broke before the response) | U06 |
 
 ## 2025 HTTP sessions (LHTTP)
 
@@ -93,6 +94,7 @@ drivers in `../drivers/mcp/` cite.
 | LHTTP-08 | INFO | Over 2025 HTTP, cancel by POSTing `notifications/cancelled`. A disconnect is not a cancellation (LHTTP-05) | `2025-11-25_basic_transports` §Sending Messages; `2025-11-25_basic_utilities_cancellation` §Cancellation Flow | U07 |
 | LHTTP-09 | MUST | Session ids are visible ASCII (0x21 to 0x7E); clients handle them securely | `2025-11-25_basic_transports` §Session Management | U07 |
 | LHTTP-10 | INFO | Over 2025 HTTP, close a request's stream once its answer is in, even when the server leaves it open. A disconnect is not a cancellation (LHTTP-05), so this cancels nothing | `2025-11-25_basic_transports` §Sending Messages to the Server ("After the JSON-RPC response has been sent, the server SHOULD terminate the SSE stream") | U07 |
+| LHTTP-11 | INFO | An answer over the client's message limit ends the request lost at once. Resuming its stream (LHTTP-05) would bring the same answer, so it isn't resumed | `2025-11-25_basic_transports` §Resumability and Redelivery (resuming is for a stream that disconnected) | U07 |
 
 ## Requests, cancellation, and progress (REQ)
 

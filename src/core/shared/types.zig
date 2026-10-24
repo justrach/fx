@@ -3270,13 +3270,13 @@ fn fuzzToolArgumentDiagnostic(_: void, smith: *std.testing.Smith) anyerror!void 
 
 test "fuzz tool argument diagnostic" {
     try std.testing.fuzz({}, fuzzToolArgumentDiagnostic, .{
-        .corpus = &.{
+        .corpus = &(@import("fuzz_seed").slices(.{
             "{\"request\":{\"task\":\"cut",
             "{\"a\":1,}",
             "{\"a\":1,\"a\":2}",
             "{\"t\":\"\xc3\xa9\xe2\x82",
             "\xff\x00{",
-        },
+        }) ++ @import("fuzz_corpus").tool_argument_diagnostic.*),
     });
 }
 

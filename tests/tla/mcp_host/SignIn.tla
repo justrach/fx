@@ -2,9 +2,11 @@
 \* fx's MCP sign-in for one HTTP server (vercel-labs/fx at 53a561bea).
 \*
 \* Code:
-\*   - src/core/mcp_host/runtime.zig: startLogin (endLogin of this server's
-\*     earlier login, then a new Login: a loopback listener and the
-\*     awaitBrowser task, then engine.signIn), awaitBrowser (the first
+\*   - src/core/mcp_host/runtime.zig: startLogin (a login already under way
+\*     for the server is the one asked for: its address is shown again;
+\*     else a new Login: a loopback listener and the awaitBrowser task, then
+\*     engine.signIn, which starts a flow only when none is running,
+\*     client.zig Auth.signIn), awaitBrowser (the first
 \*     `GET /callback`, or for a bridged server the first form posted from
 \*     the bridge's origin, carrying the state `.authorize` gave the
 \*     listener, is posted as finish_login; the task then ends),
@@ -93,19 +95,32 @@ Init ==
 \* endLogin(k): cancel its task, close its listener, forget it. No notice.
 Ended(k) == [phase EXCEPT ![k] = "closed"]
 
+\* The host's login, while it's under way.
+SigningIn(h) == live[h] # 0 /\ Open(live[h])
+
 \* `/mcp login NAME` or `fx mcp login NAME` on the current host. It waits
-\* while any other host is alive.
+\* while any other host is alive. The engine starts a flow only when none
+\* is running.
 StartLogin ==
     /\ alive[cur] /\ next <= MaxLogins
     /\ \A h \in Hosts : alive[h] => h = cur
+    /\ ~SigningIn(cur)
     /\ LET k == next
-           old == live[cur]
-       IN /\ phase' = [(IF old # 0 THEN Ended(old) ELSE phase) EXCEPT ![k] = "open"]
+       IN /\ phase' = [phase EXCEPT ![k] = "open"]
           /\ hostOf' = [hostOf EXCEPT ![k] = cur]
           /\ live' = [live EXCEPT ![cur] = k]
-          /\ flow' = [flow EXCEPT ![cur] = k]
+          /\ flow' = IF flow[cur] = 0 THEN [flow EXCEPT ![cur] = k] ELSE flow
           /\ next' = next + 1
     /\ UNCHANGED <<cur, alive, retired, leases, got, shownUrl, indicator, saved, badRedeem, foreignTaken>>
+
+\* The same, asked for while the host's login is under way: that login is
+\* the one asked for, and its listener and flow stay. Its address, if it
+\* came, is shown again.
+AgainLogin ==
+    /\ alive[cur]
+    /\ \A h \in Hosts : alive[h] => h = cur
+    /\ SigningIn(cur)
+    /\ UNCHANGED vars
 
 \* The engine's `.authorize` event for login k: the notice sets the shell's
 \* "Signing in" and carries the URL (with the state and redirect port).
@@ -216,6 +231,7 @@ Reload ==
 
 Next ==
     \/ StartLogin
+    \/ AgainLogin
     \/ \E k \in Logins : Authorize(k) \/ Handle(k) \/ Expire(k) \/ Redeemed(k, TRUE) \/ Redeemed(k, FALSE)
     \/ \E k \in Logins, s \in States, kind \in Kinds : Arrive(k, s, kind)
     \/ \E k \in Logins, s \in States : Paste(k, s)
@@ -253,6 +269,10 @@ IndicatorImpliesListener == indicator => \E k \in Logins : Open(k) /\ alive[host
 
 \* One sign-in per server, whatever hosts are alive.
 OneSignInPerServer == Cardinality({k \in Logins : Open(k)}) <= 1
+
+\* The engine's live flow is the host's login, with its listener open: the
+\* browser can come back to the sign-in the engine waits on.
+FlowHasListener == \A h \in Hosts : flow[h] # 0 => live[h] = flow[h] /\ Open(flow[h])
 
 \* ---- Liveness ----
 

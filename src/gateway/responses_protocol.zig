@@ -2167,7 +2167,7 @@ test "Responses text finalization fuzzes chunking and capture boundaries" {
             try stream.finish(buffer[0 .. len + separator.len + 4]);
         }
     };
-    try std.testing.fuzz({}, Probe.run, .{ .corpus = &.{ "", "a", "two chunks", "capture limit is not receipt progress" } });
+    try std.testing.fuzz({}, Probe.run, .{ .corpus = &(@import("fuzz_seed").slices(.{ "", "a", "two chunks", "capture limit is not receipt progress" }) ++ @import("fuzz_corpus").responses_text.*) });
 }
 
 test "Responses captures assistant commentary phase" {

@@ -113,11 +113,11 @@ test "skill display name parsing stays bounded" {
             try std.testing.expect(name.len <= buffer.len);
             try std.testing.expect(skill_contract.invalidSkillNameCause(name) == null);
         }
-    }.check, .{ .corpus = &.{
+    }.check, .{ .corpus = &(@import("fuzz_seed").slices(.{
         content_name_prefix ++ "workflow\" location=\"/skills/workflow\">",
         discovery_model_notice ++ content_name_prefix ++ "name&amp;value\" resource=\"SKILL.md\">",
         content_name_prefix ++ "bad&unknown;\" location=\"/skills/workflow\">",
-    } });
+    }) ++ @import("fuzz_corpus").skill_display_name.*) });
 }
 
 /// Borrows a previously discovered skill inventory for one invocation.

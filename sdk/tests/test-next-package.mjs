@@ -21,6 +21,7 @@ await mkdir(artifactRoot, { recursive: true });
 const root = await mkdtemp(resolve(artifactRoot, "libfx-next-"));
 const app = resolve(root, "app");
 const fixture = fileURLToPath(new URL("./next/", import.meta.url));
+const noNpmRegistry = fileURLToPath(new URL("./no-npm-registry.mjs", import.meta.url));
 const token = randomUUID();
 const env = { ...process.env, NODE_OPTIONS: "", NODE_PATH: "", NEXT_TELEMETRY_DISABLED: "1", AI_GATEWAY_API_KEY: "",
   FX_SESSIONS_DIR: resolve(root, "sessions"),
@@ -50,7 +51,8 @@ async function start(cwd, args, name) {
   // Next 16 dev forwards flags through NODE_OPTIONS, which rejects the JSPI flag.
   const jspiArgs = name === "start" || (name === "dev" && next15) ? ["--experimental-wasm-jspi"] : [];
   const child = spawn(process.execPath, [...jspiArgs, "--no-experimental-require-module", ...args, ...(name === "standalone" ? [] : ["--hostname", "127.0.0.1", "--port", String(port)])], {
-    cwd, env: { ...env, HOSTNAME: "127.0.0.1", PORT: String(port) }, detached: true, stdio: ["ignore", "pipe", "pipe"],
+    cwd, env: { ...env, HOSTNAME: "127.0.0.1", PORT: String(port), NODE_OPTIONS: `--import ${noNpmRegistry}` },
+    detached: true, stdio: ["ignore", "pipe", "pipe"],
   });
   child.stdout.pipe(log, { end: false });
   child.stderr.pipe(log, { end: false });

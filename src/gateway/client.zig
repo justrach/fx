@@ -4234,6 +4234,61 @@ test "consumeSseStream captures the resolved routing provider" {
     try std.testing.expect(second_completion.resolved_provider == null);
 }
 
+const stream_fuzz = @import("stream_fuzz_testing.zig");
+
+fn fuzzGatewayChunkedStream(_: void, smith: *std.testing.Smith) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var reasoning: stream_fuzz.Text = .{};
+    try reasoning.generate(arena, smith, "", "", false);
+    var content: stream_fuzz.Text = .{};
+    try content.generate(arena, smith, "", "", false);
+    const with_tool = smith.boolWeighted(1, 1);
+    var arguments: stream_fuzz.Text = .{};
+    try arguments.generate(arena, smith, "{\"path\":\"", "\"}", true);
+
+    var wire_buffer: std.Io.Writer.Allocating = .init(arena);
+    const wire = &wire_buffer.writer;
+    if (reasoning.text.items.len > 0) {
+        for (try reasoning.pieces(arena)) |piece| {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"type\":\"reasoning-delta\",\"id\":\"r1\",\"delta\":{f}}}", piece);
+        }
+    }
+    if (content.text.items.len > 0) {
+        for (try content.pieces(arena)) |piece| {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":{f}}}", piece);
+        }
+    }
+    if (with_tool) {
+        try wire.writeAll("data: {\"type\":\"tool-input-start\",\"id\":\"c1\",\"toolName\":\"read_file\"}\n\n");
+        for (try arguments.pieces(arena)) |piece| {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"type\":\"tool-input-delta\",\"id\":\"c1\",\"delta\":{f}}}", piece);
+        }
+        try wire.print("data: {{\"type\":\"tool-call\",\"toolCallId\":\"c1\",\"toolName\":\"read_file\",\"input\":{s}}}\n\n", .{arguments.text.items});
+    }
+    try wire.print("data: {{\"type\":\"finish\",\"finishReason\":{{\"unified\":\"{s}\"}}}}\n\ndata: [DONE]\n\n", .{if (with_tool) "tool-calls" else "stop"});
+
+    const read_buffer = try stream_fuzz.readBuffer(arena, smith);
+    var fixed = std.Io.Reader.fixed(wire_buffer.written());
+    var source = fixed.limited(.unlimited, read_buffer);
+    var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
+    var cancelled = std.atomic.Value(bool).init(false);
+    var completion = try consumeSseStreamTraced(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, &cancelled, null, null, null, null);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");
+    try deltas.expectEqual(content.text.items, reasoning.text.items);
+    try stream_fuzz.expectToolCall(completion.tool_calls, with_tool, "c1", arguments.text.items);
+}
+
+test "Gateway streams give the same result however they are cut into events and reads" {
+    try std.testing.fuzz({}, fuzzGatewayChunkedStream, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").vercel_stream.*),
+    });
+}
+
 test "consumeSseStream captures Gateway-applied service tiers" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {

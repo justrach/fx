@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
+import { readStatusPanel } from "./info-panel";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -349,10 +350,9 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
 
       await session.sendKeys("BTab");
       await session.waitForText("ask ·", TIMEOUT);
-      await session.sendText("/status");
-      const statusPane = await session.waitForText("agent_step_limit=", TIMEOUT);
-      expect(statusPane).toContain("permission_mode=ask");
-      expect(statusPane).not.toContain("sandbox=");
+      const panel = await readStatusPanel(session, TIMEOUT);
+      expect(panel.fields.Permissions).toBe("ask");
+      expect(panel.rows.join("\n").toLowerCase()).not.toContain("sandbox");
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).not.toContain("YOLO ·");
       expect(scrollback).not.toContain("YOLO enabled:");

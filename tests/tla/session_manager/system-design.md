@@ -1529,6 +1529,39 @@ for an image pasted into its prompt):
   keep D79's two copies; load every blob when the session opens; or name
   the temporary snapshot, which is gone when its process exits.
 
+Settled for `/status` (2026-10-23, after a user could find a session's id
+only by quitting):
+- **D90 Decision (amends D2's exit line and D58):** `/status` in the
+  interactive app opens a panel in the footer, and writes nothing to the
+  transcript. Its first line names the open session as `<id> · saved`
+  exactly when its log is on disk, so `fx --resume <id>` opens it, and as
+  `<id> · not saved yet` before then. A shell with no session, because none
+  could be created, shows `none · this shell can't save sessions`. While
+  the panel is open, it follows a turn that saves the session or ends. The
+  manager answers whether the log is on disk
+  (`Session.onDisk`): from the publish of the first turn, or from the open
+  of a resumed or forked session. A failed session keeps the log it had.
+  One whose first publish failed counts as not on disk, though the publish
+  may have landed before the failure, so `/status` errs toward unsaved.
+  - The adapter's `saved` asks the manager instead of counting turns. A
+    fork before the first prompt holds no turn, but its log is on disk
+    from the fork, and resume opens it. Counting turns hid it: the exit
+    line left it out, while `/status` would have to show it as unsaved.
+    Now the exit line and `/status` give the same answer for every
+    session.
+  - `fx status` runs outside any session and shows none.
+  - `tests/tla/session/ShellSession.tla` models the open session across
+    launches, prompts, `/new`, `/clear`, `/resume`, `/fork`, quitting and
+    crashes, with what `/status` and the exit line say. Its planted bugs
+    include counting turns. `tests/tla/drivers/session/` runs the real
+    binary along it and has TLC check every run.
+
+  **Why:** a user who wants to come back to a session needs its id while
+  it is open, and an id is useful only when fx says truthfully whether it
+  can be resumed yet. **Alternative:** show the id only once saved; print
+  the full `fx --resume` command; or keep counting turns and show a fork
+  before its first prompt as unsaved, though resume opens it.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

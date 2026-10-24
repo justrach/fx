@@ -1695,3 +1695,116 @@ test "compact submission allocation failure preserves the unanswered input" {
     try std.testing.expectEqual(.all_decided, try prompt.apply(alloc, .submit));
     try std.testing.expectEqualStrings("{\"value\":\"x\"}", prompt.entries.items[0].answer.?);
 }
+
+test "question prompt keeps a full ask batch consistent under seeded random input" {
+    const question_answer = @import("question_answer.zig");
+    const batch_len = question_answer.max_questions;
+    // Pages are indexed with this type, and the prompt parks at the batch
+    // length once every page is answered.
+    comptime std.debug.assert(batch_len <= std.math.maxInt(@FieldType(QuestionPrompt, "current_index")));
+    const option_count = 6;
+    // The synthetic freeform slot follows the model's options; two more
+    // ordinals exercise out-of-range selection.
+    const ordinal_count = option_count + 3;
+
+    const alloc = std.testing.allocator;
+    var label_bufs: [batch_len][option_count][16]u8 = undefined;
+    var options: [batch_len][option_count]types.QuestionOption = undefined;
+    var question_bufs: [batch_len][16]u8 = undefined;
+    var entries: [batch_len]types.QuestionBatchEntry = undefined;
+    for (&entries, &options, &label_bufs, &question_bufs, 0..) |*entry, *entry_options, *entry_labels, *question_buf, question| {
+        for (entry_options, entry_labels, 0..) |*option, *label_buf, index| {
+            option.* = .{ .label = try std.mem.print(label_buf, "Q{d}:O{d}", .{ question + 1, index + 1 }) };
+        }
+        entry.* = .{
+            .question = try std.mem.print(question_buf, "Question {d}", .{question + 1}),
+            .options = entry_options,
+        };
+    }
+
+    const Walk = struct {
+        fn answeredCount(prompt: *const QuestionPrompt) usize {
+            var count: usize = 0;
+            for (prompt.entries.items) |entry| count += @intFromBool(entry.answer != null);
+            return count;
+        }
+
+        /// Checks one event against the prompt and returns true once the
+        /// batch is fully decided.
+        fn check(prompt: *const QuestionPrompt, event: QuestionInputEvent, answered: *usize) !bool {
+            const len = prompt.entries.items.len;
+            const now = answeredCount(prompt);
+            // Navigation and re-answering never drop an earlier answer.
+            try std.testing.expect(now >= answered.*);
+            answered.* = now;
+            switch (event) {
+                .all_decided => {
+                    try std.testing.expectEqual(len, now);
+                    try std.testing.expectEqual(len, @as(usize, prompt.current_index));
+                    return true;
+                },
+                .decision => |index| {
+                    try std.testing.expect(index < len);
+                    try std.testing.expect(prompt.entries.items[index].answer != null);
+                    try std.testing.expect(prompt.current_index < len);
+                    try std.testing.expect(prompt.entries.items[prompt.current_index].answer == null);
+                },
+                .none, .redraw => try std.testing.expect(prompt.current_index < len),
+                .cancelled, .limit_exceeded => return error.TestUnexpectedResult,
+            }
+            try std.testing.expect(now < len);
+            return false;
+        }
+    };
+
+    var prompt: QuestionPrompt = .{};
+    defer prompt.deinit(alloc);
+    var seed: u64 = 0;
+    while (seed < 64) : (seed += 1) {
+        var prng: std.Random.DefaultPrng = .init(seed);
+        const random = prng.random();
+        try prompt.syncFrom(alloc, &entries);
+        try std.testing.expectEqual(@as(usize, batch_len), prompt.projection().?.entry_count);
+
+        var answered: usize = 0;
+        var decided = false;
+        var step: usize = 0;
+        while (!decided and step < 400) : (step += 1) {
+            const event = switch (random.uintLessThan(u8, 8)) {
+                0 => try prompt.apply(alloc, .next_entry),
+                1 => try prompt.apply(alloc, .{ .move_choice = if (random.boolean()) .previous else .next }),
+                2, 3 => try prompt.apply(alloc, .{ .select_ordinal = random.uintLessThan(u8, ordinal_count) }),
+                4 => try prompt.apply(alloc, .submit),
+                5 => try prompt.apply(alloc, .{ .insert_ascii = 'a' + random.uintLessThan(u8, 26) }),
+                6 => try prompt.apply(alloc, .backspace),
+                else => prompt.retreatToPrevious(),
+            };
+            decided = try Walk.check(&prompt, event, &answered);
+        }
+        // Pages the walk left unanswered take their first option. The walk
+        // may have parked on an answered page, which costs one extra
+        // selection before each selection answers a new page.
+        var remaining = batch_len - answered + 1;
+        while (!decided) : (remaining -= 1) {
+            try std.testing.expect(remaining > 0);
+            decided = try Walk.check(&prompt, try prompt.apply(alloc, .{ .select_ordinal = 0 }), &answered);
+        }
+
+        for (prompt.entries.items, 0..) |entry, page| {
+            const option = entry.options.items[entry.confirmed_choice_index.?];
+            if (option.is_freeform_slot) {
+                try std.testing.expectEqualStrings(entry.confirmed_freeform_buffer.items, entry.answer.?);
+            } else {
+                var prefix_buf: [8]u8 = undefined;
+                try std.testing.expectEqualStrings(option.label, entry.answer.?);
+                try std.testing.expect(std.mem.startsWith(
+                    u8,
+                    entry.answer.?,
+                    try std.mem.print(&prefix_buf, "Q{d}:", .{page + 1}),
+                ));
+            }
+        }
+        prompt.resetAfterSubmission(alloc);
+        try std.testing.expect(!prompt.isActive());
+    }
+}

@@ -14,9 +14,9 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   save(join(artifacts, "gate-summary.json"), results.map(({ module, label, kind, verdict, expected, distinct, exit }) => ({ module, label, kind, verdict, expected, distinct, exit })));
   expect(results.filter((r) => r.verdict === "FAIL").map((r) => r.label)).toEqual([]);
   const count = (kind: string, verdict: string) => results.filter((r) => r.kind === kind && r.verdict === verdict).length;
-  // SharedLogins, SubagentAccess and UrlRetry joined the four.
-  expect(count("smoke", "PASS")).toBe(7);
-  expect(count("stress", "PASS")).toBe(7);
+  // SharedLogins, SubagentAccess, UrlRetry and MixedBuilds joined the four.
+  expect(count("smoke", "PASS")).toBe(8);
+  expect(count("stress", "PASS")).toBe(8);
   expect(count("mutant", "CAUGHT")).toBe(results.filter((r) => r.kind === "mutant").length);
   // Credentials' two findings and its repair witness became the code.
   // HostLifecycle's OneProcessPerServer did too: it
@@ -108,6 +108,22 @@ const controls: { name: string; module: string; constants: Record<string, never>
       { event: "waiting_shown" }, { event: "complete", data: { url: 1 } }, { event: "call", data: { n: 2 } },
     ],
     badAt: 6,
+  },
+  {
+    name: "mixed builds", module: "MixedBuilds",
+    constants: { ObsRevokeOnReplay: false },
+    good: [
+      { event: "observe", data: { v2kind: "v1", v2: true, v3: false } },
+      { event: "run", data: { cmd: "get" } }, { event: "observe", data: { v2kind: "v1", v2: true, v3: false } },
+      { event: "run", data: { cmd: "signin" } }, { event: "observe", data: { v2kind: "v1", v2: true, v3: true } },
+      { event: "older", data: { op: "remove" } }, { event: "observe", data: { v2kind: "v1", v2: false, v3: true } },
+    ],
+    // A sign-in saved in the older build's store, as version 2.
+    bad: [
+      { event: "observe", data: { v2kind: "v1", v2: true, v3: false } },
+      { event: "run", data: { cmd: "signin" } }, { event: "observe", data: { v2kind: "v2", v2: true, v3: false } },
+    ],
+    badAt: 2,
   },
 ];
 

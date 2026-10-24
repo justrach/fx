@@ -1500,9 +1500,11 @@ pub const Session = struct {
         return lines.items;
     }
 
-    /// The session is on disk: it has a turn, ended or open.
+    /// The session is on disk, so `fx --resume` opens it: from its first
+    /// turn, ended or open, or from its open when it was resumed or forked.
+    /// A fork before the first prompt holds no turn and is saved (D90).
     pub fn saved(self: *const Session) bool {
-        return self.last_turn > 0;
+        return self.handle.onDisk();
     }
 
     /// The session's folder under `~/.fx/sessions/v2`, for display. Caller owns it.
@@ -1521,12 +1523,14 @@ pub const Session = struct {
     /// A copy of its capability that a background reader still holds keeps
     /// reading, and stores nothing more (D44).
     pub fn close(self: *Session) void {
+        // Before the close, which forgets whether the log is on disk.
+        const was_saved = self.saved();
         self.host.detach();
         self.handle.close() catch |err| debug_trace.logf("session", "event=sessions_v2_close_failed session={s} err={s}", .{ self.id(), @errorName(err) });
         if (self.root) traceWiring("Close", self.id(), "", self.store.pid);
         if (self.turn_open) debug_trace.logf("session", "event=sessions_v2_turn_closed_open session={s} streamed={d}", .{ self.id(), self.streamed.items.len });
         // Before `release`: the id lives in the handle.
-        if (!self.saved()) self.removeUnsavedFiles();
+        if (!was_saved) self.removeUnsavedFiles();
         self.handle.release();
         self.destroyInner();
     }

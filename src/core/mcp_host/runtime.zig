@@ -94,6 +94,9 @@ pub const Status = struct {
     last_error: ?[]const u8 = null,
     needs_login: bool = false,
     signed_in: bool = false,
+    /// A login is under way: from `/mcp login` until it signs in, fails,
+    /// or expires, through the requests before its address comes.
+    signing_in: bool = false,
     /// The variable a `missing_env` or `invalid_env` server names.
     missing: ?[]const u8 = null,
     /// What the server told fx to tell the model about it.
@@ -317,6 +320,9 @@ const Login = struct {
     /// The address the browser came back to, kept until the login ends:
     /// The engine reads the code in it when it redeems it.
     callback: ?[]u8 = null,
+    /// The authorization address, once the engine made it, for a login
+    /// asked for again: it shows the same one.
+    url: ?[]u8 = null,
 };
 
 pub const Runtime = struct {
@@ -894,6 +900,19 @@ pub const Runtime = struct {
                 const i = r.engineServer(name) orelse return r.finish(req, .{ .failed = error.UnknownServer });
                 const s = r.resolved.servers[i];
                 if (s.transport != .http) return r.finish(req, .{ .failed = error.NotHttp });
+                // The saved login is the one every other fx uses, and another fx
+                // may have saved it after this one took its own: it's revoked
+                // too, or it would stay valid at the server
+                // (`tests/tla/mcp_host/SharedLogins.tla` LogoutRevokesSaved).
+                const saved = r.options.credentials.store.lookup(r.gpa, s.credentialKey()) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.CredentialStoreUnreadable => return r.finish(req, .{ .failed = error.CredentialStoreUnreadable }),
+                    else => blk: {
+                        debug_trace.logf("mcp", "MCP saved login not read server={s} err={s}", .{ s.name, @errorName(err) });
+                        break :blk null;
+                    },
+                };
+                defer if (saved) |c| secret.zeroAndFree(r.gpa, c);
                 // The saved login goes first: a store that can't be read leaves
                 // the session signed in rather than half signed out.
                 _ = r.options.credentials.store.remove(r.gpa, s.credentialKey()) catch |err| switch (err) {
@@ -901,6 +920,10 @@ pub const Runtime = struct {
                     else => debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ s.name, @errorName(err) }),
                 };
                 try r.engine.signOut(s.name);
+                if (saved) |c| if (!r.holds(i, c) and try r.engine.adoptCredential(s.name, c)) {
+                    debug_trace.logf("mcp", "MCP logout also revokes server={s} reason=another fx saved a newer login", .{s.name});
+                    try r.engine.signOut(s.name);
+                };
                 r.flags[i] = .{};
                 // A program that exits next would lose a revocation still on
                 // its way, so the logout ends when it's answered.
@@ -914,12 +937,23 @@ pub const Runtime = struct {
         const i = r.engineServer(name) orelse return r.finish(req, .{ .failed = if (r.serverIndex(name) == null) error.UnknownServer else error.Held });
         const s = r.resolved.servers[i];
         if (s.transport != .http) return r.finish(req, .{ .failed = error.NotHttp });
+        // The sign-in already under way is the one asked for. Ending it would
+        // close the port its browser comes back to while the engine keeps its
+        // flow, so no sign-in could finish
+        // (`tests/tla/mcp_host/SignIn.tla` FlowHasListener).
+        if (r.loginFor(i)) |l| {
+            l.open_browser = l.open_browser or open_browser;
+            if (l.url) |url| {
+                r.notify(.{ .authorize = .{ .server = s.name, .url = url } });
+                if (open_browser) r.openBrowser(s.name, url);
+            }
+            return r.finish(req, .ok);
+        }
         // A sign-in that couldn't be saved would last only this session.
         r.options.credentials.store.check(r.gpa) catch |err| switch (err) {
             error.CredentialStoreUnreadable => return r.finish(req, .{ .failed = error.CredentialStoreUnreadable }),
             else => debug_trace.logf("mcp", "MCP credential store not checked server={s} err={s}", .{ s.name, @errorName(err) }),
         };
-        r.endLogin(i);
         var listener = loopback.Listener.open(r.io, s.callback_port) catch |err| switch (err) {
             // Only a fixed port can be another app's, and the message names it.
             error.AddressInUse => if (s.callback_port != null) return r.finish(req, .{ .failed = error.CallbackPortInUse }) else return err,
@@ -982,6 +1016,12 @@ pub const Runtime = struct {
         };
     }
 
+    /// The URL went out in a notice either way.
+    fn openBrowser(r: *Runtime, name: []const u8, url: []const u8) void {
+        const opened = url_opener.native_opener.open(r.gpa, url) catch false;
+        if (!opened) debug_trace.logf("mcp", "browser not opened for MCP login server={s}", .{name});
+    }
+
     fn loginFor(r: *const Runtime, server: usize) ?*Login {
         for (r.logins.items) |l| if (l.server == server) return l;
         return null;
@@ -992,6 +1032,7 @@ pub const Runtime = struct {
             l.group.cancel(r.io);
             l.listener.close(r.io);
             if (l.callback) |url| r.gpa.free(url);
+            if (l.url) |url| r.gpa.free(url);
             r.gpa.destroy(l);
             _ = r.logins.swapRemove(k);
             return;
@@ -1043,6 +1084,16 @@ pub const Runtime = struct {
                     return r.finish(req, .{ .failed = err });
                 };
                 if (req.declined and result == .ended and result.ended.outcome == .cancelled) result.ended.outcome = .unsupported_input;
+                // fx dropped the reply, and a stdio server with it: the
+                // server didn't go away by itself.
+                if (c.oversized and result == .ended) {
+                    const s = r.resolved.servers[i];
+                    debug_trace.logf("mcp", "MCP call reply dropped server={s} transport={s} reason=too_large", .{ s.name, @tagName(s.transport) });
+                    result.ended.why = if (s.transport == .stdio)
+                        "its reply was larger than fx reads in one message, so fx restarted the server"
+                    else
+                        "its reply was larger than fx reads in one message, so fx dropped it";
+                }
                 if (result == .ended and result.ended.outcome == .transport_failed) {
                     const down = if (r.enginePhase(i)) |p| p == .backoff or p == .failed else false;
                     if (down) result.ended.why = r.failureText(req.alloc, i) catch null;
@@ -1112,8 +1163,16 @@ pub const Runtime = struct {
                     r.finish(w.request, if (result) |ok| .{ .tools = ok } else |err| .{ .failed = err });
                 }
             },
-            .auth_required => {
+            .auth_required => |required| {
                 r.flags[i].needs_login = true;
+                // Only a step-up keeps the login working for what it had;
+                // otherwise the saved one, if any, doesn't sign anything in.
+                if (!required.step_up) r.flags[i].signed_in = false;
+                if (required.refused) |refused| {
+                    debug_trace.logf("mcp", "MCP login dropped server={s} reason=refresh refused status={d} error={s}", .{ name, refused.status, refused.code });
+                } else {
+                    debug_trace.logf("mcp", "MCP login needed server={s} reason={s}", .{ name, if (required.step_up) "more scopes" else "sign-in required" });
+                }
                 r.notify(.{ .needs_login = name });
                 // Nothing comes until someone logs in.
                 r.endToolWaiters(i, .needs_login);
@@ -1123,10 +1182,12 @@ pub const Runtime = struct {
                 for (r.logins.items) |l| if (l.server == i) {
                     // Only a return carrying this sign-in's state ends its wait.
                     l.listener.expect(r.io, authorize);
-                    if (!l.open_browser) continue;
-                    // The URL went out in the notice either way.
-                    const opened = url_opener.native_opener.open(r.gpa, authorize) catch false;
-                    if (!opened) debug_trace.logf("mcp", "browser not opened for MCP login server={s}", .{name});
+                    // Out of memory, a login asked for again just doesn't show it.
+                    if (r.gpa.dupe(u8, authorize)) |url| {
+                        if (l.url) |old| r.gpa.free(old);
+                        l.url = url;
+                    } else |_| {}
+                    if (l.open_browser) r.openBrowser(name, authorize);
                 };
             },
             .signed_in => {
@@ -1419,12 +1480,17 @@ pub const Runtime = struct {
                 var buf: [320]u8 = undefined;
                 r.notify(.{ .not_saved = .{ .server = s.name, .reason = notSavedReason(&buf, r.options.credentials.store, err) } });
             }
-        } else if (r.flags[i].tried) |own| {
+        } else {
+            // The tokens are gone, so this process is signed out whatever
+            // the store holds.
+            r.flags[i].signed_in = false;
+            const own = r.flags[i].tried orelse return debug_trace.logf("mcp", "MCP login dropped server={s} saved=none", .{s.name});
             // Only this process's own login goes: one another fx saved since
             // stays, for the next request to take.
-            _ = r.options.credentials.store.removeIfSame(r.gpa, s.credentialKey(), own) catch |err| {
-                debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ s.name, @errorName(err) });
+            const removed = r.options.credentials.store.removeIfSame(r.gpa, s.credentialKey(), own) catch |err| {
+                return debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ s.name, @errorName(err) });
             };
+            debug_trace.logf("mcp", "MCP login dropped server={s} saved={s}", .{ s.name, if (removed) "removed" else "kept, another fx saved a newer one" });
         }
     }
 
@@ -1496,6 +1562,7 @@ pub const Runtime = struct {
             };
             o.needs_login = r.flags[i].needs_login;
             o.signed_in = r.flags[i].signed_in;
+            o.signing_in = r.loginFor(i) != null;
             if (r.engine.instructions(s.name)) |t| o.instructions = try a.dupe(u8, t);
         }
         r.mutex.lockUncancelable(r.io);
@@ -1714,9 +1781,37 @@ pub const Runtime = struct {
             } else debug_trace.logf("mcp", "MCP refresh went ahead server={s} reason=another fx held its refresh lock too long", .{s.name});
         } else |err| debug_trace.logf("mcp", "MCP refresh went ahead server={s} reason=no refresh lock err={s}", .{ s.name, @errorName(err) });
         f.sent = true;
-        if (try r.takeSaved(f.server)) debug_trace.logf("mcp", "MCP refresh replaced server={s} reason=another fx refreshed", .{s.name});
+        const saved = r.options.credentials.store.lookup(r.gpa, s.credentialKey()) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // Whether it's still saved can't be told, so it's refreshed as before.
+            else => {
+                debug_trace.logf("mcp", "MCP saved login not read server={s} err={s}", .{ s.name, @errorName(err) });
+                return r.engine.refresh(s.name);
+            },
+        };
+        if (saved) |c| {
+            defer secret.zeroAndFree(r.gpa, c);
+            if (try r.take(f.server, c)) debug_trace.logf("mcp", "MCP refresh replaced server={s} reason=another fx refreshed", .{s.name});
+        } else if (r.flags[f.server].tried != null) {
+            // This fx's login was saved and is gone: another fx logged out of
+            // it, or removed the server. Refreshing would save it back and
+            // undo that, so this fx signs out too
+            // (`tests/tla/mcp_host/SharedLogins.tla` LogoutStays).
+            debug_trace.logf("mcp", "MCP login ended server={s} reason=signed out in another fx", .{s.name});
+            if (f.lock) |*l| l.release();
+            f.lock = null;
+            try r.engine.signOut(s.name);
+            r.flags[f.server] = .{};
+            return;
+        }
         // Nothing goes out once a saved login replaced the refresh.
         try r.engine.refresh(s.name);
+    }
+
+    /// Whether `saved` is the login server `i` last saved or took.
+    fn holds(r: *const Runtime, i: usize, saved: []const u8) bool {
+        const tried = r.flags[i].tried orelse return false;
+        return std.mem.eql(u8, &tried, &credentials.digest(saved));
     }
 
     fn retryRefreshes(r: *Runtime) void {
@@ -1747,9 +1842,14 @@ pub const Runtime = struct {
             },
         } orelse return false;
         defer secret.zeroAndFree(r.gpa, saved);
-        const digest = credentials.digest(saved);
-        if (r.flags[i].tried) |tried| if (std.mem.eql(u8, &tried, &digest)) return false;
-        r.flags[i].tried = digest;
+        return r.take(i, saved);
+    }
+
+    /// `saved` given to server `i`, as `takeSaved` does.
+    fn take(r: *Runtime, i: usize, saved: []const u8) !bool {
+        const s = r.resolved.servers[i];
+        if (r.holds(i, saved)) return false;
+        r.flags[i].tried = credentials.digest(saved);
         // One the server can't use isn't a login: the server still needs one.
         if (!try r.engine.useCredential(s.name, saved)) {
             debug_trace.logf("mcp", "MCP saved login not usable, ignored server={s}", .{s.name});

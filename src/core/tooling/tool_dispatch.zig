@@ -435,6 +435,9 @@ pub const RuntimeProviderKind = enum {
 };
 
 pub const CapturedCommandFn = *const fn (ToolInput) bool;
+/// Names the action a model call without one means, or null when it is not
+/// exactly one. See `Tool.infer_action_fn`.
+pub const InferActionFn = *const fn (std.json.ObjectMap) ?[]const u8;
 pub const ProcessLocalFn = *const fn (ToolInput) bool;
 
 pub const CallPresentation = struct {
@@ -490,6 +493,10 @@ pub const Tool = struct {
     captured_command_host: command_environment.Host = .native,
     captured_command_action: ?[]const u8 = null,
     captured_command_fn: ?CapturedCommandFn = null,
+    /// The orchestrator adds the inferred action to a model call that leaves
+    /// it out before the call is stored or admitted, so admission and decode
+    /// read the same arguments.
+    infer_action_fn: ?InferActionFn = null,
     process_local_fn: ?ProcessLocalFn = null,
     cancel_if_requested_after_call: bool = false,
     run_command_compatibility: ?RunCommandCompatibility = null,

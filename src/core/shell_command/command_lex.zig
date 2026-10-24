@@ -706,3 +706,75 @@ test "wrapper_strip_argv declines ambiguous wrappers" {
     defer timeout_argv.deinit(std.testing.allocator);
     try std.testing.expect(wrapper_strip_argv(timeout_argv.tokens) == null);
 }
+
+/// Pieces of generated commands, weighted toward the quoting, escapes, and
+/// operators where two readings of a command can disagree.
+const fuzz_fragments = [_][]const u8{
+    " ",    "\t", "a",    "-x", "=",  "'",    "\"",     "\\",
+    "\\ ",  "''", "\"\"", "|",  "||", "&",    "&&",     ";",
+    "(",    ")",  ">",    ">>", "<",  "2>&1", "&>",     "<<<",
+    ">|",   "$",  "`",    "#",  "\n", "\r",   "\u{e9}", "\x00",
+    "\xff",
+};
+
+fn writeFuzzCommand(smith: *std.testing.Smith, out: *std.Io.Writer) std.Io.Writer.Error!void {
+    for (0..smith.valueRangeAtMost(u8, 0, 24)) |_| {
+        if (smith.boolWeighted(3, 1)) {
+            try out.writeAll(fuzz_fragments[smith.index(fuzz_fragments.len)]);
+            continue;
+        }
+        var raw: [8]u8 = undefined;
+        try out.writeAll(raw[0..smith.slice(&raw)]);
+    }
+}
+
+fn fuzzTokenize(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var buffer: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writeFuzzCommand(smith, &writer) catch |err| switch (err) {
+        // A full buffer ends the command early, which is still a command.
+        error.WriteFailed => {},
+    };
+    const command = writer.buffered();
+
+    var argv = tokenize_argv(alloc, command) catch |err| {
+        // Both read quotes and escapes the same way, so both reject it.
+        try std.testing.expectError(err, pipe_segments(alloc, command));
+        return;
+    };
+    defer argv.deinit(alloc);
+    alloc.free(try pipe_segments(alloc, command));
+
+    var previous_end: usize = 0;
+    for (argv.tokens) |token| {
+        try std.testing.expect(previous_end <= token.start and token.start < token.end and token.end <= command.len);
+        try std.testing.expectEqualStrings(command[token.start..token.end], token.raw);
+        previous_end = token.end;
+    }
+
+    // Lexing the values again, each in single quotes, gives the same values.
+    var requoted: std.ArrayList(u8) = .empty;
+    defer requoted.deinit(alloc);
+    for (argv.tokens, 0..) |token, index| {
+        if (index > 0) try requoted.append(alloc, ' ');
+        try requoted.append(alloc, '\'');
+        for (token.value) |byte| {
+            if (byte == '\'') try requoted.appendSlice(alloc, "'\\''") else try requoted.append(alloc, byte);
+        }
+        try requoted.append(alloc, '\'');
+    }
+    var again = try tokenize_argv(alloc, requoted.items);
+    defer again.deinit(alloc);
+    try std.testing.expectEqual(argv.tokens.len, again.tokens.len);
+    for (argv.tokens, again.tokens) |original, round_trip| {
+        try std.testing.expectEqualStrings(original.value, round_trip.value);
+        try std.testing.expect(round_trip.quoted);
+    }
+}
+
+test "lexing generated commands is consistent and round-trips through quoting" {
+    try std.testing.fuzz({}, fuzzTokenize, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").command_lex.*),
+    });
+}

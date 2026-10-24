@@ -564,7 +564,7 @@ describe("/mcp in the shell", () => {
     });
     // Not a prompt: the composer is free, and the status line says what's waiting.
     await tui.waitForComposer(15_000);
-    await tui.waitForText("2 MCP servers need you · /mcp", 10_000);
+    await tui.waitForText("2 MCP need attention · /mcp", 10_000);
     // One left, it's named; it stays until it's handled.
     await tui.sendText("/mcp reject broken");
     await tui.waitForText("proj is waiting for approval · /mcp", 10_000);
@@ -660,6 +660,11 @@ describe("/mcp in the shell", () => {
     await tui.waitForText("MCP servers  3", 10_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("↑↓ navigate     enter run     esc back", 10_000);
+    // ← goes back to the list like Esc, and → opens the server like Enter.
+    await tui.sendKeys("Left");
+    await tui.waitForText("↑↓ navigate     enter open     esc close", 5_000);
+    await tui.sendKeys("Right");
+    await tui.waitForText("↑↓ navigate     enter run     esc back", 10_000);
     await tui.sendKeys("C-c");
     await tui.waitForPane((pane) => !pane.includes("MCP servers") && !pane.includes("esc back"), 5_000);
     expect(await tui.capturePane()).not.toContain("press ctrl+c again to exit");
@@ -678,33 +683,37 @@ describe("/mcp in the shell", () => {
     await tui.waitForText("↑↓ navigate     enter run     esc back", 5_000);
     expect(await tui.capturePane()).not.toContain("Approved proj");
 
-    // Confirmed, it runs `/mcp approve proj`, which prints in the conversation.
+    // Confirmed, it runs `/mcp approve proj`. The menu shows the result, so
+    // the conversation doesn't repeat it.
     await tui.sendKeys("Enter");
     await tui.waitForText("enter confirm     esc cancel", 5_000);
     await tui.sendKeys("Enter");
-    await tui.waitForText("Approved proj, which runs: node proj.js --port 4100", 10_000);
     // The reload follows, and the screen with it.
     await tui.waitForText("› Reject        /mcp reject proj", 10_000);
+    expect(await tui.captureFullScrollback()).not.toContain("Approved proj");
 
     // Remove asks which file it edits; Esc keeps the server, Enter removes it.
     await tui.sendKeys("Escape");
     await tui.waitForText("MCP servers  3", 5_000);
-    await tui.sendKeys("Up Enter");
+    // Approved, proj works and sorts between fixture and web.
+    await tui.sendKeys("Down Enter");
     await tui.waitForText("› Remove        /mcp remove web", 5_000);
     await tui.sendKeys("Enter");
-    // It asks in the hint line; the server's screen stays as it was.
-    await tui.waitForText("Remove web from ~/.fx/mcp.json?     enter yes     esc no", 5_000);
-    expect(await tui.capturePane()).toContain("› Remove        /mcp remove web");
-    await tui.sendKeys("Escape");
+    // It asks on Remove's own row, with its answers; the hint line stays.
+    await tui.waitForText("› Remove web from ~/.fx/mcp.json?   yes  no", 5_000);
+    expect(await tui.capturePane()).toContain("↑↓ navigate     enter run     esc back");
+    // → chooses no, and Enter on no keeps the server.
+    await tui.sendKeys("Right Enter");
+    await tui.waitForText("› Remove        /mcp remove web", 5_000);
     await tui.waitForText("↑↓ navigate     enter run     esc back", 5_000);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toBeDefined();
     await tui.sendKeys("Enter");
     await tui.waitForText("Remove web from ~/.fx/mcp.json?", 5_000);
     await tui.sendKeys("Enter");
-    await tui.waitForText("Removed web from ~/.fx/mcp.json.", 10_000);
-    // Its screen goes with it, back to the list.
+    // Its screen goes with it, back to the list, which no longer shows it.
     await tui.waitForText("MCP servers  2", 10_000);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toBeUndefined();
+    expect(await tui.captureFullScrollback()).not.toContain("Removed web");
   }, 90_000);
 });
 

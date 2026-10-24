@@ -2337,6 +2337,67 @@ test "chat completions stream framing handles chunks trailers truncation and wir
     defer result.deinit(alloc);
 }
 
+const stream_fuzz = @import("stream_fuzz_testing.zig");
+
+fn fuzzChunkedStream(_: void, smith: *std.testing.Smith) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var reasoning: stream_fuzz.Text = .{};
+    try reasoning.generate(arena, smith, "", "", false);
+    var content: stream_fuzz.Text = .{};
+    try content.generate(arena, smith, "", "", false);
+    const with_tool = smith.boolWeighted(1, 1);
+    var arguments: stream_fuzz.Text = .{};
+    try arguments.generate(arena, smith, "{\"path\":\"", "\"}", true);
+
+    var wire_buffer: std.Io.Writer.Allocating = .init(arena);
+    const wire = &wire_buffer.writer;
+    if (reasoning.text.items.len > 0) {
+        for (try reasoning.pieces(arena)) |piece| {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning\":{f}}}}}]}}", piece);
+        }
+    }
+    for (try content.pieces(arena), 0..) |piece, index| {
+        if (index == 0) {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"id\":\"chat-1\",\"model\":\"resolved-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":{f}}},\"finish_reason\":null}}]}}", piece);
+        } else {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{f}}}}}]}}", piece);
+        }
+    }
+    if (with_tool) {
+        for (try arguments.pieces(arena), 0..) |piece, index| {
+            if (index == 0) {
+                try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{{\"name\":\"read_file\",\"arguments\":{f}}}}}]}}}}]}}", piece);
+            } else {
+                try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"arguments\":{f}}}}}]}}}}]}}", piece);
+            }
+        }
+    }
+    try wire.print("data: {s}\n\ndata: [DONE]\n\n", .{if (with_tool) test_tools_finish else test_stop});
+
+    const read_buffer = try stream_fuzz.readBuffer(arena, smith);
+    var fixed = std.Io.Reader.fixed(wire_buffer.written());
+    var source = fixed.limited(.unlimited, read_buffer);
+    var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
+    const cancelled = std.atomic.Value(bool).init(false);
+    var result = try consume_stream(std.testing.allocator, &source.interface, test_tool_request(), .{}, deltas.sink(), &cancelled, null);
+    defer result.deinit(std.testing.allocator);
+
+    if (result != .completed) return error.TestStreamFailed;
+    const completion = result.completed.completion;
+    try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");
+    try deltas.expectEqual(content.text.items, reasoning.text.items);
+    try stream_fuzz.expectToolCall(completion.tool_calls, with_tool, "call-1", arguments.text.items);
+}
+
+test "chat completions streams give the same result however they are cut into events and reads" {
+    try std.testing.fuzz({}, fuzzChunkedStream, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").chat_completions_stream.*),
+    });
+}
+
 test "chat completions reducer caps events content identities arguments tools and nesting" {
     const alloc = std.testing.allocator;
     for ([_]struct { limits: Limits, chunk: []const u8, failure: Error }{

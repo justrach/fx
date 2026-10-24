@@ -52,6 +52,50 @@ export function writeProject(f: Fixture, servers: Record<string, unknown>) {
   writeFileSync(join(f.workspace, ".mcp.json"), JSON.stringify({ mcpServers: servers }, null, 2));
 }
 
+// ---- sign-in against the fake HTTP server ----
+
+export const MODERN = "2026-07-28";
+const SIGN_IN_RULES = [
+  { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+  { method: "tools/list", result: { resultType: "complete", tools: [{ name: "echo", inputSchema: { type: "object" } }] } },
+];
+
+/** The fake Streamable HTTP server with fake OAuth (`HTTP_FAKE`), serving one echo tool. */
+export async function startFake(f: Fixture, server: Record<string, unknown> = {}) {
+  if (!existsSync(HTTP_FAKE)) throw new Error(`harness: the fake HTTP server is missing at ${HTTP_FAKE}`);
+  const rules = join(f.base, "rules.json"), auth = join(f.base, "auth.json"), log = join(f.base, "http-fake.jsonl");
+  writeFileSync(rules, JSON.stringify(SIGN_IN_RULES));
+  writeFileSync(auth, JSON.stringify({ servers: [server], challengeScope: "mcp:read" }));
+  const child = Bun.spawn([BUN, HTTP_FAKE, "--script", rules, "--log", log, "--auth", auth], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const reader = child.stdout.getReader();
+  let text = "";
+  const deadline = Date.now() + 10_000;
+  while (!text.includes("\n") && Date.now() < deadline) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    text += new TextDecoder().decode(value);
+  }
+  const port = JSON.parse(text.split("\n")[0]!).listening as number;
+  const entries = () => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []) as { t: number; dir?: string; path?: string; form?: Record<string, string>; json?: { redirect_uris?: string[] } }[];
+  return { url: `http://127.0.0.1:${port}/mcp`, entries, stop: () => child.kill() };
+}
+
+export const redemptions = (entries: ReturnType<Awaited<ReturnType<typeof startFake>>["entries"]>) =>
+  entries.filter((e) => e.dir === "auth" && e.path?.endsWith("/token") && e.form?.grant_type === "authorization_code");
+
+/** `fx mcp login --no-browser web` with stdin left open, its output read as it comes. */
+export async function cliLogin(binary: string, f: Fixture) {
+  const child = Bun.spawn([binary, "mcp", "login", "--no-browser", "web"], { cwd: f.workspace, env: fxEnv(f), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  let out = "", err = "";
+  void (async () => { for await (const c of child.stdout) out += new TextDecoder().decode(c); })();
+  void (async () => { for await (const c of child.stderr) err += new TextDecoder().decode(c); })();
+  const killer = setTimeout(() => child.kill("SIGKILL"), 60_000);
+  return {
+    child, out: () => out, err: () => err,
+    async done() { const code = await child.exited; clearTimeout(killer); await Bun.sleep(50); return code; },
+  };
+}
+
 export interface Ran { args: string[]; code: number; stdout: string; stderr: string; ms: number }
 
 /** Runs the binary once, with an explicit timeout; every run is appended to `runs.jsonl`. */
@@ -103,7 +147,9 @@ export async function probe(port: number, path = "/favicon.ico"): Promise<{ resu
 // ---- credentials ----
 
 export const credDir = (f: Fixture) => join(f.home, ".fx", "mcp-credentials");
-export const v2Path = (f: Fixture) => join(credDir(f), "credentials-v2.json");
+export const storePath = (f: Fixture) => join(credDir(f), "credentials-v3.json");
+/** The store older builds keep, which this one never opens (MixedBuilds.tla). */
+export const olderStorePath = (f: Fixture) => join(credDir(f), "credentials-v2.json");
 export const v1Path = (f: Fixture) => join(credDir(f), "credentials.json");
 
 /** A v1 login as v1's store keeps it (mcp_auth_store.zig, its own test's shape). */
@@ -121,11 +167,11 @@ export function writeV1(f: Fixture, entries: object[]) {
   writeFileSync(v1Path(f), JSON.stringify({ version: 1, credentials: entries }), { mode: 0o600 });
 }
 
-/** The documents as the model sees them: the v2 one's kind and entries; v1's logins. */
+/** The documents as the model sees them: the store's kind and entries; v1's logins. */
 export function observeStores(f: Fixture) {
   let kind = "absent", entries: string[] = [];
-  if (existsSync(v2Path(f))) {
-    const text = readFileSync(v2Path(f), "utf8");
+  if (existsSync(storePath(f))) {
+    const text = readFileSync(storePath(f), "utf8");
     try {
       const doc = JSON.parse(text);
       entries = (doc.servers ?? []).map((s: { name: string }) => s.name).sort();

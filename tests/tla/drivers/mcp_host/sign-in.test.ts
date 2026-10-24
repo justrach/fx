@@ -4,53 +4,12 @@
 // the loopback callback, and the code redemption the fake logs. Checked
 // against SignIn.tla through SignInTrace.tla.
 import { expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { artifacts, binary } from "../lib/context";
-import { BUN, HTTP_FAKE, fixture, fxEnv, probe, save, stdioServer, waitFor, writeProfile, type Fixture } from "./driver";
+import { BUN, cliLogin, fixture, probe, redemptions, save, startFake, stdioServer, waitFor, writeProfile } from "./driver";
 import { Shell } from "./shell";
 import { checkTrace, type TraceRecord } from "./trace";
-
-const MODERN = "2026-07-28";
-const RULES = [
-  { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
-  { method: "tools/list", result: { resultType: "complete", tools: [{ name: "echo", inputSchema: { type: "object" } }] } },
-];
-
-async function startFake(f: Fixture, server: Record<string, unknown> = {}) {
-  if (!existsSync(HTTP_FAKE)) throw new Error(`harness: the fake HTTP server is missing at ${HTTP_FAKE}`);
-  const rules = join(f.base, "rules.json"), auth = join(f.base, "auth.json"), log = join(f.base, "http-fake.jsonl");
-  writeFileSync(rules, JSON.stringify(RULES));
-  writeFileSync(auth, JSON.stringify({ servers: [server], challengeScope: "mcp:read" }));
-  const child = Bun.spawn([BUN, HTTP_FAKE, "--script", rules, "--log", log, "--auth", auth], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-  const reader = child.stdout.getReader();
-  let text = "";
-  const deadline = Date.now() + 10_000;
-  while (!text.includes("\n") && Date.now() < deadline) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    text += new TextDecoder().decode(value);
-  }
-  const port = JSON.parse(text.split("\n")[0]!).listening as number;
-  const entries = () => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []) as { t: number; dir?: string; path?: string; form?: Record<string, string>; json?: { redirect_uris?: string[] } }[];
-  return { url: `http://127.0.0.1:${port}/mcp`, entries, stop: () => child.kill() };
-}
-
-const redemptions = (entries: ReturnType<Awaited<ReturnType<typeof startFake>>["entries"]>) =>
-  entries.filter((e) => e.dir === "auth" && e.path?.endsWith("/token") && e.form?.grant_type === "authorization_code");
-
-/** `fx mcp login --no-browser web` with stdin left open, its output read as it comes. */
-async function cliLogin(f: Fixture) {
-  const child = Bun.spawn([binary, "mcp", "login", "--no-browser", "web"], { cwd: f.workspace, env: fxEnv(f), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-  let out = "", err = "";
-  void (async () => { for await (const c of child.stdout) out += new TextDecoder().decode(c); })();
-  void (async () => { for await (const c of child.stderr) err += new TextDecoder().decode(c); })();
-  const killer = setTimeout(() => child.kill("SIGKILL"), 60_000);
-  return {
-    child, out: () => out, err: () => err,
-    async done() { const code = await child.exited; clearTimeout(killer); await Bun.sleep(50); return code; },
-  };
-}
 
 async function signInScenario(name: string, tamper: boolean) {
   const f = fixture(artifacts, name);
@@ -60,7 +19,7 @@ async function signInScenario(name: string, tamper: boolean) {
   const at = () => Date.now();
   try {
     records.push({ event: "login", at: at() });
-    const login = await cliLogin(f);
+    const login = await cliLogin(binary, f);
     const url = await waitFor("the authorization URL", () => /\n\s+(http\S+)\n/.exec(login.out())?.[1], 30_000);
     records.push({ event: "authorize", data: { login: 1 }, at: at(), note: url });
     const authorize = new URL(url);
@@ -115,7 +74,7 @@ test("control: a sign-in redeems the code of the callback whose state matches, t
   expect(r.out).toContain("Signed in to web.");
   expect(r.tokens.length).toBe(1);
   expect(r.after.result).toBe("closed");
-  expect(readFileSync(join(r.f.home, ".fx", "mcp-credentials", "credentials-v2.json"), "utf8")).toContain("\"name\":\"web\"");
+  expect(readFileSync(join(r.f.home, ".fx", "mcp-credentials", "credentials-v3.json"), "utf8")).toContain("\"name\":\"web\"");
   expect(r.verdict.verdict).toBe("ACCEPTED");
 }, 120_000);
 
@@ -141,7 +100,7 @@ test("contract: a return naming another issuer redeems nothing, and fx says the 
   const fake = await startFake(f, { iss: "wrong" });
   writeProfile(f, { web: { type: "http", url: fake.url } });
   try {
-    const login = await cliLogin(f);
+    const login = await cliLogin(binary, f);
     const url = await waitFor("the authorization URL", () => /\n\s+(http\S+)\n/.exec(login.out())?.[1], 30_000);
     const redirect = await fetch(url, { redirect: "manual" });
     const location = new URL(redirect.headers.get("location")!);
@@ -167,7 +126,7 @@ test("contract: a pasted return with a state fx never made redeems nothing, and 
   const fake = await startFake(f);
   writeProfile(f, { web: { type: "http", url: fake.url } });
   try {
-    const login = await cliLogin(f);
+    const login = await cliLogin(binary, f);
     const url = await waitFor("the authorization URL", () => /\n\s+(http\S+)\n/.exec(login.out())?.[1], 30_000);
     const redirect = await fetch(url, { redirect: "manual" });
     const wrong = new URL(redirect.headers.get("location")!);
@@ -184,6 +143,77 @@ test("contract: a pasted return with a state fx never made redeems nothing, and 
     expect(redemptions(fake.entries())).toEqual([]);
   } finally { fake.stop(); }
 }, 120_000);
+
+// Fixed. Before the fix a second `/mcp login` closed the first one's
+// listener, the port the browser comes back to, while the engine kept the
+// first flow and ignored the second, so no return could finish the sign-in
+// (SignIn.tla FlowHasListener). On the code before it fails here: the second
+// `/mcp login` never shows an address.
+test("contract: a login asked for again while one waits is that login: the same address, its port stays open, and its return signs in (trace ACCEPTED)", async () => {
+  const f = fixture(artifacts, "signin-again");
+  const fake = await startFake(f);
+  writeProfile(f, { web: { type: "http", url: fake.url } });
+  const shell = new Shell(f);
+  const records: TraceRecord[] = [];
+  // The n-th sign-in address the transcript printed, from 0.
+  const address = async (n: number) => {
+    const deadline = Date.now() + 20_000;
+    for (;;) {
+      const found = [...(await shell.tui.captureFullScrollback()).matchAll(/go to:\n\s+(http\S+)/g)].map((m) => m[1]!);
+      if (found.length > n) return found[n]!;
+      if (Date.now() > deadline) throw new Error(`timed out waiting for sign-in address ${n + 1}`);
+      await Bun.sleep(100);
+    }
+  };
+  try {
+    await shell.start({}, 400);
+    records.push({ event: "login", at: Date.now() });
+    await shell.tui.sendText("/mcp login web");
+    const first = await address(0);
+    records.push({ event: "authorize", data: { login: 1 }, at: Date.now(), note: first });
+    const signing = await shell.status({ k: "signing" }, 10_000);
+    expect(signing?.k).toBe("signing");
+    records.push({ event: "status", data: { signing: true }, at: Date.now() });
+    const port = Number(new URL(new URL(first).searchParams.get("redirect_uri")!).port);
+    expect((await probe(port)).result).toBe("open");
+    records.push({ event: "probe", data: { login: 1, result: "open" }, at: Date.now() });
+
+    records.push({ event: "login", at: Date.now() });
+    await shell.tui.sendText("/mcp login web");
+    const again = await address(1);
+    expect(again).toBe(first);
+    const still = await probe(port);
+    records.push({ event: "probe", data: { login: 1, result: still.result }, at: Date.now() });
+
+    const redirect = await fetch(first, { redirect: "manual" });
+    const location = new URL(redirect.headers.get("location")!);
+    records.push({ event: "callback", data: { login: 1, state: 1, kind: "get" }, at: Date.now() });
+    const back = await fetch(location.toString(), { signal: AbortSignal.timeout(10_000) }).catch((e) => ({ status: 0, text: async () => String(e) }));
+    save(join(f.base, "callback.json"), { location: location.toString(), status: back.status, body: (await back.text()).slice(0, 400) });
+    await shell.tui.waitForText("Signed in to web.", 20_000);
+    const ended = Date.now();
+    const tokens = redemptions(fake.entries());
+    for (const t of tokens) records.push({ event: "redeem", data: { login: 1 }, at: Math.min(t.t, ended - 1) });
+    records.push({ event: "signed_in", data: { login: 1 }, at: ended });
+    const after = await probe(port);
+    records.push({ event: "probe", data: { login: 1, result: after.result }, at: Date.now() });
+    records.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+    const verdict = await checkTrace({ module: "SignIn", records, dir: join(f.base, "trace"), constants: { ObsMaxLogins: 1, ObsMaxHosts: 1, ObsMaxLeases: 0, ObsBridge: false } });
+    save(join(f.base, "verdict.json"), verdict);
+    expect(still.result).toBe("open");
+    expect(back.status).toBe(200);
+    expect(tokens.length).toBe(1);
+    // The second request started nothing: one client, registered once.
+    expect(fake.entries().filter((e) => e.path?.endsWith("/register")).length).toBe(1);
+    expect(after.result).toBe("closed");
+    expect(verdict.verdict).toBe("ACCEPTED");
+    await shell.quit();
+  } finally {
+    await shell.stop();
+    save(join(f.base, "http-fake-entries.json"), fake.entries());
+    fake.stop();
+  }
+}, 150_000);
 
 // Fixed by stopping the sign-in and saying so. Before the fix this
 // case was a finding: the shell kept saying "Signing in" and the trace broke

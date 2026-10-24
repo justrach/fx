@@ -1017,11 +1017,11 @@ fn fuzz_vision_json(_: void, smith: *std.testing.Smith) !void {
 
 test "Vision JSON parsers tolerate arbitrary bounded bytes" {
     try std.testing.fuzz({}, fuzz_vision_json, .{
-        .corpus = &.{
+        .corpus = &(@import("fuzz_seed").slices(.{
             "{\"image_ids\":[1],\"focus\":\"inspect\"}",
             "{\"images\":[{\"image_id\":1,\"status\":\"failed\",\"error\":\"vision_unavailable\"}]}",
             "{",
-        },
+        }) ++ @import("fuzz_corpus").vision_json.*),
     });
 }
 

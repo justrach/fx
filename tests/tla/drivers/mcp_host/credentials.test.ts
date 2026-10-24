@@ -8,11 +8,11 @@ import { expect, test } from "bun:test";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { artifacts, binary } from "../lib/context";
-import { fixture, fxEnv, observeStores, runFx, save, v1Entry, v1Path, v2Path, writeProfile, writeV1, type Fixture } from "./driver";
+import { fixture, fxEnv, observeStores, runFx, save, v1Entry, v1Path, storePath, writeProfile, writeV1, type Fixture } from "./driver";
 import { checkTrace, type TraceRecord } from "./trace";
 
 const URL = "http://127.0.0.1:9/mcp";
-const UNREADABLE = "fx can't read the saved MCP sign-ins in ~/.fx/mcp-credentials/credentials-v2.json. A newer fx saved them, or they're damaged; fix or delete them, then try again.\n";
+const UNREADABLE = "fx can't read the saved MCP sign-ins in ~/.fx/mcp-credentials/credentials-v3.json. A newer fx saved them, or they're damaged; fix or delete them, then try again.\n";
 
 function setup(name: string) {
   const f = fixture(artifacts, name);
@@ -53,15 +53,15 @@ class Session {
 const CREDENTIAL = JSON.stringify({ access: "kept-by-newer-fx", refresh: "r", expires_at_ms: null, token_endpoint: "http://127.0.0.1:9/token", revocation_endpoint: null, resource: URL, client_id: "c", client_secret: null, method: "none" });
 
 /** fx's MCP credential store holding web's login, as `version` (this fx reads 1 and 2, and writes 2). */
-function writeV2(f: Fixture, version = 1) {
+function writeStore(f: Fixture, version = 1) {
   mkdirSync(join(f.home, ".fx", "mcp-credentials"), { recursive: true, mode: 0o700 });
-  writeFileSync(v2Path(f), JSON.stringify({ version, servers: [{ name: "web", url: URL, credential: CREDENTIAL }] }), { mode: 0o600 });
+  writeFileSync(storePath(f), JSON.stringify({ version, servers: [{ name: "web", url: URL, credential: CREDENTIAL }] }), { mode: 0o600 });
 }
 
 /** A newer fx's document: version 3, which this fx can't read. */
 function rewriteAsVersion(f: Fixture, version: number) {
-  const doc = JSON.parse(readFileSync(v2Path(f), "utf8"));
-  writeFileSync(v2Path(f), JSON.stringify({ ...doc, version }), { mode: 0o600 });
+  const doc = JSON.parse(readFileSync(storePath(f), "utf8"));
+  writeFileSync(storePath(f), JSON.stringify({ ...doc, version }), { mode: 0o600 });
 }
 
 test("control: v1's login is never taken over, and v1's store is left as it is (trace ACCEPTED)", async () => {
@@ -81,8 +81,8 @@ test("control: v1's login is never taken over, and v1's store is left as it is (
 
 test("A newer fx's store is never written over; sign-in and sign-out say why they can't, and the login is there once it's readable (trace ACCEPTED)", async () => {
   const s = new Session(setup("cred-unreadable"));
-  writeV2(s.f, 3);
-  const before = readFileSync(v2Path(s.f), "utf8");
+  writeStore(s.f, 3);
+  const before = readFileSync(storePath(s.f), "utf8");
   save(join(s.f.base, "store-before.json"), before);
   expect(s.observe()).toEqual({ kind: "unreadable", entries: ["web"], v1: [] });
 
@@ -96,8 +96,8 @@ test("A newer fx's store is never written over; sign-in and sign-out say why the
   expect(login.ran.code).toBe(1);
   expect(login.ran.stderr).toBe(`Can't sign in to web: ${UNREADABLE}`);
   // Independent oracle: the file is byte for byte what the newer fx wrote.
-  save(join(s.f.base, "store-after.json"), readFileSync(v2Path(s.f), "utf8"));
-  expect(readFileSync(v2Path(s.f), "utf8")).toBe(before);
+  save(join(s.f.base, "store-after.json"), readFileSync(storePath(s.f), "utf8"));
+  expect(readFileSync(storePath(s.f), "utf8")).toBe(before);
   expect(login.o).toEqual({ kind: "unreadable", entries: ["web"], v1: [] });
 
   // Readable again (version 1), the login is still there and still used.
@@ -106,37 +106,37 @@ test("A newer fx's store is never written over; sign-in and sign-out say why the
   s.observe();
   const back = await s.run("get", ["mcp", "list", "--json"]);
   expect(back.o).toEqual({ kind: "ok", entries: ["web"], v1: [] });
-  expect(readFileSync(v2Path(s.f), "utf8")).toContain("kept-by-newer-fx");
+  expect(readFileSync(storePath(s.f), "utf8")).toContain("kept-by-newer-fx");
   const verdict = await s.check(["unreadable"], ["web"]);
   expect(verdict.verdict).toBe("ACCEPTED");
 }, 120_000);
 
 test("a logout stays when the store becomes unreadable (trace ACCEPTED)", async () => {
   const s = new Session(setup("cred-logout-unreadable"));
-  writeV2(s.f);
+  writeStore(s.f);
   s.observe();
   const out = await s.run("logout", ["mcp", "logout", "web"], "web");
   expect(out.ran.stdout).toBe("Signed out of web.\n");
   expect(out.o.entries).toEqual([]);
   rewriteAsVersion(s.f, 3);
   s.fault("unreadable");
-  const before = readFileSync(v2Path(s.f), "utf8");
+  const before = readFileSync(storePath(s.f), "utf8");
   expect(s.observe().kind).toBe("unreadable");
   const back = await s.run("get", ["mcp", "list", "--json"]);
   const verdict = await s.check(["ok"], ["web"]);
   // Independent oracle: nothing was written.
   expect(back.o).toEqual({ kind: "unreadable", entries: [], v1: [] });
-  expect(readFileSync(v2Path(s.f), "utf8")).toBe(before);
+  expect(readFileSync(storePath(s.f), "utf8")).toBe(before);
   expect(verdict.verdict).toBe("ACCEPTED");
 }, 120_000);
 
 test("With fx's MCP credential store deleted after a logout, v1's login still isn't taken (trace ACCEPTED)", async () => {
   const s = new Session(setup("cred-deleted"));
   writeV1(s.f, [v1Entry("web", URL)]);
-  writeV2(s.f);
+  writeStore(s.f);
   s.observe();
   await s.run("logout", ["mcp", "logout", "web"], "web");
-  rmSync(v2Path(s.f));
+  rmSync(storePath(s.f));
   s.fault("delete");
   s.observe();
   const back = await s.run("get", ["mcp", "list", "--json"]);

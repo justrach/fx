@@ -315,7 +315,7 @@ async function runSameShellRelaunch(outRoot: string, runNumber: number): Promise
     );
 
     await launchFx(context, session, "first");
-    await submitSlashCommand(context, session, "/status", "permission_mode", "first-status-visible");
+    await submitSlashCommand(context, session, "/allowlist", "* allowlist: effective", "first-notice-visible");
     await quitFx(context, session, "first");
 
     await runShellCommand(

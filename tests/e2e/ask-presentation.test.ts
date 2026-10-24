@@ -272,15 +272,20 @@ describe("fx ask presentation", () => {
     };
     const shellTool = firstRequest.tools.find(({ name }) => name === "shell");
     const shellSchema = shellTool?.inputSchema;
-    expect(Object.keys(shellSchema?.properties ?? {})).toEqual(["request"]);
-    expect(shellSchema?.required).toEqual(["request"]);
-    expect(shellSchema?.additionalProperties).toBe(false);
-    const branches = shellSchema?.properties?.request?.oneOf ?? [];
-    expect(branches.map((branch: any) => branch.properties.action.enum[0])).toEqual([
-      "run",
-      "interact",
-      "stop",
+    // No-save asks advertise the process-only fields, flat with one action enum.
+    expect(Object.keys(shellSchema?.properties ?? {})).toEqual([
+      "action",
+      "command",
+      "cwd",
+      "profile",
+      "yield_time_ms",
+      "timeout_ms",
+      "session_id",
+      "force",
     ]);
+    expect(shellSchema?.required).toEqual(["action"]);
+    expect(shellSchema?.additionalProperties).toBe(false);
+    expect(shellSchema?.properties?.action?.enum).toEqual(["run", "interact", "stop"]);
     const serializedShellTool = JSON.stringify(shellTool);
     expect(serializedShellTool).not.toContain('"tty"');
     expect(serializedShellTool).not.toContain('"write"');

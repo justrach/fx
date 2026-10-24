@@ -17,6 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
+import { closeStatusPanel, panelAuth, readStatusPanel, waitForStatusPanel } from "./info-panel";
 import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
 import { equivalentPngEncodings, solidPng } from "./fixtures/image-encoding";
@@ -1552,8 +1553,7 @@ for (const otherProvider of ["codex", "grok"] as const) {
       AI_GATEWAY_API_KEY: undefined,
     });
     await session.waitForComposer(TIMEOUT);
-    await session.sendText("/status");
-    await session.waitForText("auth=fx login", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "fx login");
     const authPath = join(home, ".fx", "auth.json");
     linkSync(authPath, join(home, "login.alias"));
     await session.sendText("/logout");
@@ -1974,20 +1974,13 @@ tmuxTest(
         expect(response.error.message).toContain("Saved credential storage is unavailable");
         session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, env);
         await session.waitForComposer(TIMEOUT);
-        await session.sendText("/status");
-        await session.waitForText("auth_help=", TIMEOUT);
-        expect(await session.captureFullScrollback()).toContain(
-          "auth_help=Saved credential storage is unavailable",
-        );
+        const unavailable = await readStatusPanel(session, TIMEOUT, (panel) => panel.fields["Auth help"] !== undefined);
+        expect(unavailable.fields["Auth help"]).toContain("Saved credential storage is unavailable");
         await selectEnvKeyCredential(session);
         await session.sendText("Use the working Gateway account.");
         await session.waitForText(`GATEWAY_RECOVERED_${provider}`, TIMEOUT);
-        await session.sendText("/status");
-        await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
-        const scrollback = await session.captureFullScrollback();
-        const recoveredStatus = scrollback.slice(scrollback.lastIndexOf("* status:"));
-        expect(recoveredStatus).toContain("auth=AI_GATEWAY_API_KEY");
-        expect(recoveredStatus).not.toContain("auth_help=");
+        const recovered = await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
+        expect(recovered.labels).not.toContain("Auth help");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await session.kill();
         session = null;
@@ -2514,11 +2507,7 @@ tmuxTest(
     expect(existsSync(authPath)).toBe(true);
     expect(statSync(authPath).mode & 0o077).toBe(0);
 
-    await session.sendText("/status");
-    await session.waitForText(
-      "model_source=Codex subscription",
-      TIMEOUT,
-    );
+    await readStatusPanel(session, TIMEOUT, (panel) => panel.fields.Provider === "Codex subscription");
     await session.sendLiteralText("/model");
     await session.sendKeys("Tab");
     const picker = await session.waitForPane(
@@ -2605,8 +2594,7 @@ tmuxTest(
       },
     );
     await session.waitForComposer(TIMEOUT);
-    await session.sendText("/status");
-    await session.waitForText("model=gpt-5.6-sol", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panel.fields.Model === "gpt-5.6-sol");
     await selectEnvKeyCredential(session);
     await session.waitForText("Switched to Vercel AI Gateway", TIMEOUT);
     const savedGateway = JSON.parse(readFileSync(settingsPath, "utf8"));
@@ -2626,8 +2614,7 @@ tmuxTest(
     await session.sendText("/logout codex");
     await session.waitForText("Signed out of Codex.", TIMEOUT);
     expect(existsSync(authPath)).toBe(false);
-    await session.sendText("/status");
-    await session.waitForText(`model=${gatewayModelBefore}`, TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panel.fields.Model === gatewayModelBefore);
     expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
     chatgptOauth.setModels([
       { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
@@ -2684,8 +2671,7 @@ tmuxTest(
     const selected = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
     expect(selected.provider).toBe("codex");
     expect(selected.models.codex).toBe("gpt-5.6-sol");
-    await session.sendText("/status");
-    await session.waitForText("model_source=Codex subscription", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panel.fields.Provider === "Codex subscription");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -3026,16 +3012,16 @@ for (const [provider, help] of [
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/status");
-    await session.waitForText("auth_help=", TIMEOUT);
-    const scrollback = await session.captureFullScrollback();
-    expect(scrollback).toContain(`auth_help=${help}`);
-    if (provider !== "gateway") {
-      expect(scrollback).toContain(`model_source=${provider === "codex" ? "Codex" : "Grok"} subscription`);
-      expect(scrollback).not.toContain("auth_help=fx needs access to Vercel AI Gateway");
-    }
-    expect(scrollback).toContain("auth=missing");
-    expect(scrollback).toContain("auth_refreshable=false");
+    const panel = await waitForStatusPanel(session, TIMEOUT, (shown) => shown.fields["Auth help"] !== undefined);
     expect(await session.captureFullScrollbackEscapes()).toContain(help);
+    await closeStatusPanel(session, TIMEOUT);
+    expect(panel.fields["Auth help"]).toStartWith(help);
+    if (provider !== "gateway") {
+      expect(panel.fields.Provider).toBe(`${provider === "codex" ? "Codex" : "Grok"} subscription`);
+      expect(panel.fields["Auth help"]).not.toContain("fx needs access to Vercel AI Gateway");
+    }
+    // Missing, and not refreshable.
+    expect(panel.fields.Auth).toBe("missing");
     expect(gateway.requests).toHaveLength(0);
     expect(readFileSync(settingsPath, "utf8")).toBe(settings);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -3057,21 +3043,17 @@ for (const [source, help] of [
     gateway = startFakeGateway([fakeGatewayFinalText("EXPLICIT_KEY_RECOVERED")]);
     session = await startFx(home, stderrPath, gateway);
     await session.waitForComposer(TIMEOUT);
-    await session.sendText("/status");
-    await session.waitForText("auth_help=", TIMEOUT);
-    const missing = await session.captureFullScrollback();
-    expect(missing).toContain(`auth_help=${help}`);
-    expect(missing).not.toContain("set AI_GATEWAY_API_KEY");
+    const missing = await readStatusPanel(session, TIMEOUT, (panel) => panel.fields["Auth help"] !== undefined);
+    expect(missing.fields["Auth help"]).toStartWith(help);
+    expect(missing.fields["Auth help"]).not.toContain("set AI_GATEWAY_API_KEY");
     expect(gateway.requests).toHaveLength(0);
     expect(readFileSync(settingsPath, "utf8")).toBe(settings);
 
     await selectEnvKeyCredential(session);
     await session.sendText("Verify the account with a greeting.");
     await session.waitForText("EXPLICIT_KEY_RECOVERED", TIMEOUT);
-    await session.sendText("/status");
-    await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
-    const scrollback = await session.captureFullScrollback();
-    expect(scrollback.slice(scrollback.lastIndexOf("* status:"))).not.toContain("auth_help=");
+    const recovered = await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
+    expect(recovered.labels).not.toContain("Auth help");
     expect(JSON.parse(readFileSync(settingsPath, "utf8")).credential_source).toBe("ai_gateway_api_key");
     expect(gateway.requests).toHaveLength(1);
     expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
@@ -3095,18 +3077,22 @@ tmuxTest("/status preserves a missing selected login through explicit key recove
   session = await startFx(home, stderrPath, gateway);
   await session.waitForComposer(TIMEOUT);
   await session.sendText("/status");
-  await session.waitForText("auth_help=", TIMEOUT);
-  const missing = await session.captureFullScrollback();
-  expect(missing).toContain("auth_help=fx login is selected but unavailable.");
-  expect(missing).toContain("Run /login to reconnect");
-  expect(missing).not.toContain("or set AI_GATEWAY_API_KEY");
+  const missing = await waitForStatusPanel(session, TIMEOUT, (panel) => panel.fields["Auth help"] !== undefined);
   expect(await session.captureFullScrollbackEscapes()).toContain("fx login is selected but unavailable.");
+  await closeStatusPanel(session, TIMEOUT);
+  expect(missing.fields["Auth help"]).toStartWith("fx login is selected but unavailable.");
+  expect(missing.fields["Auth help"]).toContain("Run /login to reconnect");
+  expect(missing.fields["Auth help"]).not.toContain("or set AI_GATEWAY_API_KEY");
   expect(gateway.requests).toHaveLength(0);
   expect(readFileSync(settingsPath, "utf8")).toBe(settings);
 
   writeFileSync(settingsPath, "{broken");
-  await session.sendText("/status");
-  await session.waitForText("Failed to load settings:", TIMEOUT);
+  // Unreadable settings leave the selected credential unknown, so the panel
+  // says so and shows no auth.
+  const unreadable = await readStatusPanel(session, TIMEOUT, (panel) => panel.fields.Settings !== undefined);
+  expect(unreadable.fields.Settings).toStartWith("couldn't be read: ");
+  expect(unreadable.labels).not.toContain("Auth");
+  expect(unreadable.labels).not.toContain("Auth help");
   expect(gateway.requests).toHaveLength(0);
   writeFileSync(settingsPath, settings);
 
@@ -3115,11 +3101,9 @@ tmuxTest("/status preserves a missing selected login through explicit key recove
   await session.waitForText("SELECTED_KEY_RECOVERED", TIMEOUT);
   expect(JSON.parse(readFileSync(settingsPath, "utf8")).credential_source).toBe("ai_gateway_api_key");
   writeFileSync(settingsPath, "{broken");
-  await session.sendText("/status");
-  await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
-  const scrollback = await session.captureFullScrollback();
-  const recovered = scrollback.slice(scrollback.lastIndexOf("* status:"));
-  expect(recovered).not.toContain("auth_help=");
+  const recovered = await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
+  expect(recovered.labels).not.toContain("Auth help");
+  expect(recovered.labels).not.toContain("Settings");
   expect(readFileSync(settingsPath, "utf8")).toBe("{broken");
   expect(gateway.requests).toHaveLength(1);
   expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -3145,9 +3129,8 @@ for (const provider of ["codex", "grok"] as const) {
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout vercel");
     await session.waitForText("No fx login session found.", TIMEOUT);
-    await session.sendText("/status");
-    await session.waitForText("auth_help=", TIMEOUT);
-    expect(await session.captureFullScrollback()).toContain("auth_help=Saved credential storage is unavailable");
+    const unavailable = await readStatusPanel(session, TIMEOUT, (panel) => panel.fields["Auth help"] !== undefined);
+    expect(unavailable.fields["Auth help"]).toContain("Saved credential storage is unavailable");
     expect(existsSync(credentialPath)).toBe(true);
     expect(readFileSync(settingsPath, "utf8")).toBe(settings);
     expect(gateway.requests).toHaveLength(0);
@@ -3302,8 +3285,7 @@ profileStoredKeyTmuxTest(
       FX_DISABLE_KEYCHAIN: undefined,
     });
     await session.waitForComposer(TIMEOUT);
-    await session.sendText("/status");
-    await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
 
     // Typing the full path exercises both space-advance columns: the space
     // after "vercel" opens the methods, the space after "api-key" opens the
@@ -3321,8 +3303,7 @@ profileStoredKeyTmuxTest(
     expect(keyColumn).toContain("env · AI_GATEWAY_API_KEY");
     await session.sendKeys("Escape");
     await session.sendKeys("C-u");
-    await session.sendText("/status");
-    await session.waitForText("auth=stored API key (profile file)", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "stored API key (profile file)");
     expect(savedCredentialSource(home)).toBe("stored_key");
 
     const keyPath = join(home, ".fx", "api-key");
@@ -3334,8 +3315,7 @@ profileStoredKeyTmuxTest(
       FX_DISABLE_KEYCHAIN: undefined,
     });
     await session.waitForComposer(TIMEOUT);
-    await session.sendText("/status");
-    await session.waitForText("auth=stored API key (profile file)", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "stored API key (profile file)");
     await session.sendText("use the stored key after restart");
     await session.waitForText(STORED_RESPONSE, TIMEOUT);
     expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${STORED_TOKEN}`);
@@ -3368,8 +3348,7 @@ tmuxTest(
 
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
-    await session.sendText("/status");
-    await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
 
     await session.sendText("/login");
     await session.waitForPane(
@@ -3386,8 +3365,7 @@ tmuxTest(
     await session.waitForText("Vercel team · Search:", TIMEOUT);
     await session.sendKeys("Enter");
     await session.waitForText("Changed Vercel team to Vercel Labs", TIMEOUT);
-    await session.sendText("/status");
-    await session.waitForText("auth=fx login", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "fx login");
     expect(savedCredentialSource(home)).toBe("fx_login");
     await session.sendText("use the direct login credential");
     await session.waitForText(DIRECT_LOGIN_RESPONSE, TIMEOUT);
@@ -3398,8 +3376,7 @@ tmuxTest(
     await session.kill();
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
-    await session.sendText("/status");
-    await session.waitForText("auth=fx login", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "fx login");
     await session.sendText("use the remembered direct login credential");
     await session.waitForText(RESTART_RESPONSE, TIMEOUT);
     expect(gateway.requests[1].headers.get("authorization")).toBe(
@@ -3408,14 +3385,12 @@ tmuxTest(
 
     await selectEnvKeyCredential(session);
     expect(savedCredentialSource(home)).toBe("ai_gateway_api_key");
-    await session.sendText("/status");
-    await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
 
     await session.kill();
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
-    await session.sendText("/status");
-    await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
     await session.sendText("use automatic precedence after restart");
     await session.waitForText(ENV_RESPONSE, TIMEOUT);
     expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
@@ -3445,8 +3420,7 @@ tmuxTest(
 
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
-    await session.sendText("/status");
-    await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
 
     await openProviderPicker(session);
     await session.sendKeys("Enter");
@@ -3458,8 +3432,7 @@ tmuxTest(
     await session.waitForText("vercel-labs", TIMEOUT);
     await session.sendKeys("Enter");
     await session.waitForText("Changed Vercel team to Vercel Labs", TIMEOUT);
-    await session.sendText("/status");
-    await session.waitForText("auth=fx login", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "fx login");
     expect(savedCredentialSource(home)).toBe("fx_login");
 
     const savedAuth = JSON.parse(readFileSync(join(home, ".fx", "auth.json"), "utf8")) as {
@@ -3472,8 +3445,7 @@ tmuxTest(
     await session.kill();
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
-    await session.sendText("/status");
-    await session.waitForText("auth=fx login", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "fx login");
     await session.sendText("use the selected team after restart");
     await session.waitForText(LOGIN_RESPONSE, TIMEOUT);
     expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
@@ -3512,8 +3484,7 @@ tmuxTest(
     expect(initial).not.toContain("Sign in with Vercel");
     expect(initial).not.toContain("Switch credential");
 
-    await session.sendText("/status");
-    await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
     await session.sendText("use normal startup precedence");
     await session.waitForText(ENV_RESPONSE, TIMEOUT);
     expect(gateway.requests).toHaveLength(1);
@@ -3521,8 +3492,7 @@ tmuxTest(
     expect(readFileSync(authPath, "utf8")).toBe(seededAuthFile);
 
     await selectFxLoginCredential(session);
-    await session.sendText("/status");
-    await session.waitForText("auth=fx login", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "fx login");
     const selectedAuth = JSON.parse(readFileSync(authPath, "utf8")) as {
       team_id?: string;
       team_slug?: string;
@@ -3540,10 +3510,9 @@ tmuxTest(
     await session.kill();
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
-    await session.sendText("/status");
     // The switch above is remembered, so the restart keeps fx login rather than
     // letting AI_GATEWAY_API_KEY reclaim it through precedence.
-    await session.waitForText("auth=fx login", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "fx login");
     expect(JSON.parse(readFileSync(authPath, "utf8")).team_slug).toBe("vercel-labs");
     await session.sendText("use the remembered credential after restart");
     await session.waitForText(RESTART_RESPONSE, TIMEOUT);
@@ -3598,8 +3567,7 @@ tmuxTest(
       (await session.captureFullScrollback()).match(/Signed in to Vercel\./g) ?? [],
     ).toHaveLength(1);
 
-    await session.sendText("/status");
-    await session.waitForText("auth=fx login", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "fx login");
     await session.sendText("direct login prompt");
     await session.waitForText(DIRECT_LOGIN_RESPONSE, TIMEOUT);
     expect(gateway.requests).toHaveLength(4);
@@ -3618,8 +3586,7 @@ tmuxTest(
       { tokenTypeHint: "refresh_token", validForm: true },
       { tokenTypeHint: "access_token", validForm: true },
     ]);
-    await session.sendText("/status");
-    await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
     await session.sendText("use the API key after logout");
     await session.waitForText(LOGOUT_FALLBACK_RESPONSE, TIMEOUT);
     expect(gateway.requests).toHaveLength(5);
@@ -6629,8 +6596,7 @@ tmuxTest(
     ).toHaveLength(1);
     expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
 
-    await session.sendText("/status");
-    await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
 
     await session.sendText("prove environment auth remains active");
     await session.waitForText(ENV_RESPONSE, TIMEOUT);
@@ -6680,8 +6646,7 @@ tmuxTest(
     await session.waitForText("Signed out of fx.", TIMEOUT);
     expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
 
-    await session.sendText("/status");
-    await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
     await session.sendText("prove the active API key was unchanged");
     await session.waitForText(ENV_RESPONSE, TIMEOUT);
     expect(gateway.requests).toHaveLength(1);
@@ -6709,8 +6674,7 @@ tmuxTest(
     const loggedOut = await session.waitForText("Signed out of fx.", TIMEOUT);
     expect(existsSync(authPath)).toBe(false);
 
-    await session.sendText("/status");
-    await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "AI_GATEWAY_API_KEY");
     expect(oauth.requests).toEqual([]);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
     for (const secret of [
@@ -6754,8 +6718,7 @@ tmuxTest(
     );
     expect(existsSync(authPath)).toBe(true);
 
-    await session.sendText("/status");
-    await session.waitForText("auth=missing", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "missing");
     expect(gateway.requests).toHaveLength(0);
     expect(oauth.requests).toEqual([]);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -6780,8 +6743,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
     await session.waitForText("Signed out of fx.", TIMEOUT);
-    await session.sendText("/status");
-    await session.waitForText("auth=missing", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "missing");
 
     await session.sendText("/setup");
     const picker = await session.waitForPane(
@@ -6879,8 +6841,7 @@ tmuxTest(
     expect(gateway.requests).toHaveLength(3);
     expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
     await Bun.sleep(Math.max(0, expiresAt - 60_000 + 100 - Date.now()));
-    await session.sendText("/status");
-    await session.waitForText("auth_expired=true", TIMEOUT);
+    await readStatusPanel(session, TIMEOUT, (panel) => panel.fields.Auth?.split(" · ").includes("expired") === true);
     const sessionIds = rootSessionIds(home);
     expect(sessionIds).toHaveLength(1);
     const historyPath = join(sessionDir(home, sessionIds[0]!), "log.jsonl");

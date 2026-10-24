@@ -604,6 +604,40 @@ describe("modern MCP stdio compatibility", () => {
       return root;
     };
 
+    // fx reads at most 16 MiB of one stdio message: past that it drops the
+    // reply and restarts the server. Before, the model was told the server
+    // went away, as if it had crashed.
+    test("a stdio reply over fx's message limit tells the model fx restarted the server for it", async () => {
+      const root = createRoot("oversized-reply", MODERN_FIXTURE);
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      profile.mcp.fixture.environment.FX_MCP_RESULT_PAD_BYTES = String(17 * 1024 * 1024);
+      writeFileSync(profilePath, JSON.stringify(profile));
+      let first = "";
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
+        fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
+        (body: string) => {
+          first = toolResultText(body, "call_mcp");
+          return fakeGatewayFinalText("OVERSIZED_REPLY_DONE");
+        },
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the MCP tool."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway),
+        timeoutMs: 40_000,
+      });
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout).output).toContain("OVERSIZED_REPLY_DONE");
+      expect(first).toContain("its reply was larger than fx reads in one message, so fx restarted the server");
+      expect(first).not.toContain("the server went away");
+      const wire = readWire(root.wireLogPath);
+      expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+      await expectFixtureProcessesExited(wire);
+    }, 60_000);
+
     test("fx ask keeps a big MCP result whole behind a handle, and read_tool_result reaches its end", async () => {
       const root = bigResultRoot("big-result-stored");
       let stored = "";

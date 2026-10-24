@@ -311,6 +311,46 @@ function outerQuestionBatchCall() {
   ]);
 }
 
+const FULL_QUESTION_BATCH = 20;
+const QUESTION_COUNT_REJECTION =
+  `(ask_user_question: provide 1 to ${FULL_QUESTION_BATCH} questions)`;
+
+function batchQuestionText(index: number) {
+  return `Batch decision ${String(index + 1).padStart(2, "0")}?`;
+}
+
+function batchQuestions(count: number) {
+  return Array.from({ length: count }, (_, index) => ({
+    question: batchQuestionText(index),
+    options: [
+      { label: `Keep ${index + 1}`, description: "Leave this setting as it is." },
+      { label: `Change ${index + 1}`, description: "Apply the proposed change." },
+    ],
+  }));
+}
+
+function outerBatchQuestionCall(id: string, count: number) {
+  return outerToolCalls([
+    { id, name: "ask_user_question", input: { questions: batchQuestions(count) } },
+  ]);
+}
+
+function toolResultText(body: string, callId: string): string {
+  const prompt = (JSON.parse(body) as { prompt: Array<{ content: unknown }> }).prompt;
+  for (const message of prompt) {
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content as Array<Record<string, unknown>>) {
+      if (part.type !== "tool-result" || part.toolCallId !== callId) continue;
+      const output = part.output as { value?: unknown } | undefined;
+      if (typeof output?.value !== "string") {
+        throw new Error(`Tool result ${callId} has no text output`);
+      }
+      return output.value;
+    }
+  }
+  throw new Error(`Missing tool result for ${callId}`);
+}
+
 function outerLongQuestionAnswerCall() {
   return outerToolCalls([
     {
@@ -2485,6 +2525,98 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await assertProcessAliveAndClean(ctx);
     },
     TIMEOUT,
+  );
+
+  test(
+    "a full 20-question batch opens as one prompt, survives navigation and resize, and returns every answer in order",
+    async () => {
+      const finalMarker = "full question batch handled";
+      const ctx = await launchScenario([
+        outerBatchQuestionCall("question_batch_oversized", FULL_QUESTION_BATCH + 1),
+        outerBatchQuestionCall("question_batch_full", FULL_QUESTION_BATCH),
+        outerText(finalMarker),
+      ]);
+      const waitForPage = (page: number) =>
+        waitForPaneState(
+          ctx.session,
+          `full batch page ${page} of ${FULL_QUESTION_BATCH}`,
+          (value) =>
+            value.includes(batchQuestionText(page - 1)) &&
+            value.includes(`Question ${page} of ${FULL_QUESTION_BATCH}`),
+          TIMEOUT,
+        );
+
+      await ctx.session.sendText("Ask every setup decision at once.");
+      await waitForPage(1);
+
+      // The model is offered the full batch size, and one more question is
+      // rejected without opening a prompt.
+      const tools = (JSON.parse(ctx.gateway.requests[0]!.body) as {
+        tools: Array<{ name: string; description: string; inputSchema: any }>;
+      }).tools;
+      const askTool = tools.find((tool) => tool.name === "ask_user_question");
+      expect(askTool?.inputSchema.properties.questions.maxItems).toBe(FULL_QUESTION_BATCH);
+      expect(askTool?.description).toStartWith(`Ask the user 1-${FULL_QUESTION_BATCH} `);
+      expect(ctx.gateway.requests).toHaveLength(2);
+      expect(toolResultText(ctx.gateway.requests[1]!.body, "question_batch_oversized"))
+        .toBe(QUESTION_COUNT_REJECTION);
+
+      // Bursts of tab keys land on the right page and wrap past the last one.
+      await ctx.session.sendKeys(Array(13).fill("Tab").join(" "));
+      await waitForPage(14);
+      await ctx.session.sendKeys(Array(FULL_QUESTION_BATCH - 13).fill("Tab").join(" "));
+      await waitForPage(1);
+      await ctx.session.sendKeys(Array(13).fill("Tab").join(" "));
+      await waitForPage(14);
+
+      // A narrow terminal keeps the current page, and the counter returns
+      // once the hint row has room again.
+      await ctx.session.resizeWindow(48, 24);
+      await waitForPaneState(
+        ctx.session,
+        "narrow full batch page",
+        (value) => value.includes(batchQuestionText(13)) && value.includes("Change 14"),
+        TIMEOUT,
+      );
+      await ctx.session.resizeWindow(120, 40);
+      await waitForPage(14);
+      await ctx.session.sendKeys(Array(FULL_QUESTION_BATCH - 13).fill("Tab").join(" "));
+      await waitForPage(1);
+
+      // One burst answers every page: even pages keep, odd pages change.
+      const choices = Array.from({ length: FULL_QUESTION_BATCH }, (_, index) =>
+        index % 2 === 0 ? "1" : "2"
+      );
+      await ctx.session.sendLiteralText(choices.join(""));
+      await ctx.session.waitForText(finalMarker, TIMEOUT);
+
+      expect(ctx.gateway.requests).toHaveLength(3);
+      const answers = JSON.parse(
+        toolResultText(ctx.gateway.requests[2]!.body, "question_batch_full"),
+      ) as Array<{ question: string; answer: string }>;
+      expect(answers).toEqual(
+        Array.from({ length: FULL_QUESTION_BATCH }, (_, index) => ({
+          question: batchQuestionText(index),
+          answer: `${index % 2 === 0 ? "Keep" : "Change"} ${index + 1}`,
+        })),
+      );
+
+      // The transcript lists every answer once, hanging under its numbered
+      // question even after the number grows to two digits.
+      const scrollback = await ctx.session.captureFullScrollback();
+      expect(scrollback).not.toContain(`of ${FULL_QUESTION_BATCH + 1}`);
+      const lines = scrollback.split("\n").map((line) => line.trimEnd());
+      for (let index = 0; index < FULL_QUESTION_BATCH; index += 1) {
+        const prefix = `  ${index + 1}) `;
+        const resolution = `${prefix}${batchQuestionText(index)}`;
+        expect(lines.filter((line) => line === resolution)).toHaveLength(1);
+        expect(lines[lines.indexOf(resolution) + 1]).toBe(
+          `${" ".repeat(prefix.length)}${answers[index]!.answer}`,
+        );
+      }
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT * 2,
   );
 
   test(

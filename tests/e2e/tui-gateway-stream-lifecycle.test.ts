@@ -17,6 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT } from "../evals/eval-helpers";
+import { closePanel, waitForPanel } from "./info-panel";
 import {
   AUTO_EXA_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
@@ -4742,7 +4743,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const readFilename = "ACTIVE_PERMISSION_READ_SENTINEL.txt";
       const toolHeader = "● 1 tool call · 1 read";
       const toolMarker = `└ Read ${readFilename}`;
-      const permissionMarker = "* permissions: mode=auto";
       const activeBefore = "ACTIVE_PERMISSION_BEFORE_SENTINEL\n";
       const activeAfter = "ACTIVE_PERMISSION_AFTER_SENTINEL\n";
       const followupPrompt = "ACTIVE_PERMISSION_FOLLOWUP_PROMPT_SENTINEL";
@@ -4789,7 +4789,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "held post-tool continuation",
       );
 
+      // The panel opens in the footer while the held turn keeps running above it.
       await session.sendText("/permissions");
+      await waitForPanel(session, "Permissions", TIMEOUT, (panel) => panel.fields.Mode === "auto");
       await waitForEscapedScrollback(
         session,
         (candidate) => {
@@ -4798,11 +4800,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             hold.started &&
             visible.includes(toolHeader) &&
             visible.includes(toolMarker) &&
-            visible.includes(permissionMarker) &&
             visible.includes("Generating");
         },
-        "local permissions output during held post-tool continuation",
+        "the permissions panel during held post-tool continuation",
       );
+      await closePanel(session, "Permissions", TIMEOUT);
       expect(heldGateway.requests).toHaveLength(2);
       expect(hold.cancelled).toBe(false);
 

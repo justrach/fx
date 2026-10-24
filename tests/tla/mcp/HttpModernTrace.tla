@@ -22,6 +22,7 @@ Step(r) ==
       [] r.event = "answer" -> Answer(r.data.answer)
       [] r.event = "http_failure" -> HttpFailure
       [] r.event = "stream_broken" -> StreamBroken
+      [] r.event = "too_large" -> TooLarge
       [] r.event = "relisted" -> Relisted(r.data.ok)
       [] r.event = "cancel" -> Cancel
       [] OTHER -> FALSE

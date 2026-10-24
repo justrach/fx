@@ -456,7 +456,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .provider, .command = "/provider", .aliases = &.{"/setup"}, .help_entry = "/provider (/setup)", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },
     .{ .kind = .usage, .command = "/usage", .aliases = &.{}, .help_entry = "/usage", .completion_description = "show your provider's usage and spend", .presentation_category = .account },
-    .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration", .presentation_category = .general, .show_in_welcome = true },
+    .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration and the session ID", .presentation_category = .general, .show_in_welcome = true },
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true, .accepts_payload = true },

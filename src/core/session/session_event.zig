@@ -3171,12 +3171,12 @@ test "conversation frame rejects an oversized diff content handle" {
 
 test "conversation frame decoder stays bounded under fuzzed bytes" {
     try std.testing.fuzz({}, fuzzConversationFrame, .{
-        .corpus = &.{
+        .corpus = &(@import("fuzz_seed").slices(.{
             "",
             "{}\n",
             "{\"schema_version\":1}\n",
             "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":0,\"event\":{\"assistant\":{\"text\":\"ok\"}}}\n",
-        },
+        }) ++ @import("fuzz_corpus").session_conversation_frame.*),
     });
 }
 

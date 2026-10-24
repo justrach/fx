@@ -1783,9 +1783,8 @@ test.skipIf(!tmuxAvailable())(
       expect(compact).not.toContain(stdoutTail);
       expect(compact).not.toContain(stderrTail);
 
-      await active.sendText("/status");
-      const status = await active.waitForText(/model|permission_mode/i, TIMEOUT);
-      expect(status.toLowerCase()).toMatch(/model|permission_mode/);
+      await active.sendText("/allowlist");
+      await active.waitForText("* allowlist: effective", TIMEOUT);
       expect(active.paneStatus()).toEqual({ dead: false, status: null });
       const sessionId = sessionIdFromHome(home);
 
@@ -5893,6 +5892,124 @@ test.skipIf(!tmuxAvailable())(
     }
   },
   TIMEOUT * 4,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a full 20-question batch replays every answer after resume",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-question-batch-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    const workspaceRoot = realpathSync(workspace);
+    const batchSize = 20;
+    const question = (index: number) =>
+      `RESUME_BATCH_QUESTION_${String(index + 1).padStart(2, "0")}`;
+    const answer = (index: number) =>
+      `${index % 2 === 0 ? "Keep" : "Change"} ${index + 1}`;
+    const completion = "RESUME_QUESTION_BATCH_COMPLETED";
+    const followUp = "RESUME_QUESTION_BATCH_FOLLOW_UP";
+    const gateways: Array<ReturnType<typeof startFakeGateway>> = [];
+    let active: TmuxSession | null = null;
+
+    // Each answer hangs under its numbered question, aligned with the
+    // question text even once the number has two digits.
+    const expectEveryAnswer = (scrollback: string) => {
+      const lines = scrollback.split("\n").map((line) => line.trimEnd());
+      for (let index = 0; index < batchSize; index += 1) {
+        const prefix = `  ${index + 1}) `;
+        const row = lines.indexOf(`${prefix}${question(index)}`);
+        expect(row).toBeGreaterThanOrEqual(0);
+        expect(lines[row + 1]).toBe(`${" ".repeat(prefix.length)}${answer(index)}`);
+      }
+      expect(scrollback).not.toContain("● Asked");
+    };
+
+    try {
+      const initialGateway = startFakeGateway([
+        fakeGatewayToolCall("resume_question_batch", "ask_user_question", {
+          questions: Array.from({ length: batchSize }, (_, index) => ({
+            question: question(index),
+            options: [
+              { label: `Keep ${index + 1}`, description: "Leave it as it is." },
+              { label: `Change ${index + 1}`, description: "Apply the change." },
+            ],
+          })),
+        }),
+        fakeGatewayFinalText(completion),
+      ]);
+      gateways.push(initialGateway);
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, initialGateway),
+        stderrPath,
+        width: 100,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Ask the prepared batch of questions.");
+      await active.waitForText(`Question 1 of ${batchSize}`, TIMEOUT);
+      await active.sendLiteralText(
+        Array.from({ length: batchSize }, (_, index) => (index % 2 === 0 ? "1" : "2")).join(""),
+      );
+      expectEveryAnswer(await waitForScrollback(active, completion));
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+
+      let resumedBody = "";
+      const resumedGateway = startFakeGateway([
+        (body: string) => {
+          resumedBody = body;
+          return fakeGatewayFinalText(followUp);
+        },
+      ]);
+      gateways.push(resumedGateway);
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume-last`,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, resumedGateway),
+        stderrPath,
+        width: 100,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      expectEveryAnswer(await waitForScrollback(active, completion));
+
+      await active.sendText("Continue after the resumed batch.");
+      await active.waitForText(followUp, TIMEOUT);
+      const resumedPrompt = (JSON.parse(resumedBody) as {
+        prompt: Array<{ content: unknown }>;
+      }).prompt;
+      const replayed = resumedPrompt
+        .flatMap((message) => Array.isArray(message.content) ? message.content : [])
+        .find((part: Record<string, unknown>) =>
+          part.type === "tool-result" && part.toolCallId === "resume_question_batch"
+        ) as { output: { value: string } } | undefined;
+      expect(JSON.parse(replayed!.output.value)).toEqual(
+        Array.from({ length: batchSize }, (_, index) => ({
+          question: question(index),
+          answer: answer(index),
+        })),
+      );
+      expect(active.isPaneAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) await active.kill();
+      for (const gateway of gateways) gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
 );
 
 test.skipIf(!tmuxAvailable())(
