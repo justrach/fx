@@ -1,10 +1,10 @@
 # Gateway stable-prefix caching experiment
 
-An explicit cache boundary before mutable runtime context preserved Claude's stable instruction prefix when the workspace branch changed. This experiment does not establish a latency improvement or an improvement for the other tested vendors.
+An explicit cache boundary before mutable runtime context preserved the stable instruction prefix on Claude Haiku, Opus, and Sonnet when the workspace branch changed. These measurements do not establish a general latency improvement or an improvement for the non-Anthropic vendors.
 
 ## Method
 
-The experiment made 30 live requests through fx's native Vercel AI Gateway adapter: five model vendors, three turns before the cache-boundary patch and three after it. Each sequence used an isolated session and a unique synthetic system prefix:
+The initial five-model experiment made 30 live requests through fx's native Vercel AI Gateway adapter: five model vendors, three turns before the cache-boundary patch and three after it. Each sequence used an isolated session and a unique synthetic system prefix:
 
 1. Start with a long stable instruction containing public Vercel AI SDK source.
 2. Resume the session without changing the workspace context.
@@ -30,13 +30,32 @@ Cache-read percentages are the share of input tokens read from cache, not reques
 
 The resolved providers were Fireworks, Moonshot AI, Anthropic, OpenAI, and Vertex, respectively. fx's cache counters matched Gateway on every request. All 30 processes exited successfully with clean stderr.
 
-Claude's changed-context request read 34,259 tokens from cache after the patch, compared with zero before it. Its reported model cost fell from $0.0043579 to $0.00041874, while process time increased from 2.110s to 7.303s.
+Haiku's changed-context request read 34,259 tokens from cache after the patch, compared with zero before it. Its reported model cost fell from $0.0043579 to $0.00041874, while process time increased from 2.110s to 7.303s.
 
 Gateway metadata summed to approximately $0.236 in `cost` and $0.239 in `gatewayCost` for all 30 requests. These fields are reported metadata, not an invoice. DeepSeek's resolved provider charged more than the public model catalog estimate.
 
+## Opus and Sonnet follow-up
+
+A follow-up made 12 live requests with `anthropic/claude-opus-5.5` and `anthropic/claude-sonnet-5.5`, selected from the live Gateway catalog. Both arms ran this checkout's built `./zig-out/bin/fx` at commit `cfa5de350e0bffc0eca4bfa7d962bf84770a272d`. For the baseline, the observer removed only the explicit stable-instruction cache marker. The improved arm retained it. Automatic Gateway caching, message roles and order, live runtime context, and native session affinity remained unchanged.
+
+The two models ran in parallel. Within each model, the three baseline turns preceded the three improved turns, using separate sessions and unique synthetic system prefixes. The follow-up reused the pinned public source, context-freshness question, branch change, low reasoning effort, disabled Fast and Ultrafast, 1,024-token output cap, and privacy filtering described above. Each model was limited to six paid requests, with no model tools or paid retries.
+
+Before billing, both six-turn loopback preflights passed. After normalizing the unique synthetic prefix and removing the improved marker, all three request pairs for each model were identical.
+
+| Model | Unchanged-context cache read, baseline / improved | Changed-context cache read, baseline / improved | Changed-context process time, baseline / improved | Changed-context reported model cost, baseline / improved |
+| --- | ---: | ---: | ---: | ---: |
+| `anthropic/claude-opus-5.5` | 99.89% / 99.89% | 0% / 98.32% | 4.775s / 3.058s | $0.174316 / $0.009897 |
+| `anthropic/claude-sonnet-5.5` | 99.89% / 99.89% | 0% / 98.32% | 4.799s / 2.311s | $0.0871705 / $0.0049487 |
+
+Both models resolved to Anthropic. All 12 answers named the current branch, all processes exited successfully with clean stderr, and fx's cache counters matched Gateway on every request.
+
+On the changed-context turn, Opus read 34,255 of 34,841 input tokens from cache with the marker, compared with zero of 34,840 without it. Cache writes fell from 34,836 to 582 tokens. Sonnet read 34,257 of 34,843 input tokens from cache with the marker, compared with zero of 34,845 without it; cache writes fell from 34,841 to 582 tokens.
+
+For these 12 requests, Gateway metadata summed to approximately $0.820 in `cost` and $0.821 in `gatewayCost`. These are reported metadata, not an invoice. The changed-context process times fell in this sample, but the models ran concurrently and each condition was measured only once. The follow-up supports cache retention on Opus and Sonnet, not a general latency guarantee.
+
 ## Failures and limits
 
-- 29 of 30 answers named the current branch. Gemini returned the previous branch on the changed-context turn after the patch, despite receiving `git_branch: cache-next` and reporting zero cache-read tokens. The patch does not resolve that response failure or Gemini's cache miss.
+- In the initial five-model experiment, 29 of 30 answers named the current branch. Gemini returned the previous branch on the changed-context turn after the patch, despite receiving `git_branch: cache-next` and reporting zero cache-read tokens. The patch does not resolve that response failure or Gemini's cache miss.
 - Only Anthropic uses the explicit marker added by this patch. The other tested vendors remain on their existing implicit caching behavior. DeepSeek varied in both directions, so its changed-context gain is not attributed to the patch.
 - There was one three-turn sequence per model per arm, with no randomized ordering or statistical confidence. The measurements do not establish a latency improvement.
 - The unique system prefix separated each sequence, but common tool definitions could already be cached. The changed OpenAI arm's initial request read 3,584 cached tokens.
