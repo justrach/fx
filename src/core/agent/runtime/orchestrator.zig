@@ -7429,6 +7429,7 @@ fn processQueuedPromptLoop(
                 .provider_options = provider_opts,
                 .max_output_tokens = model_capabilities.requestOutputTokens(request_capabilities),
                 .budget = .{ .cancel_flag = config.cancel_flag },
+                .prompt_cache_key = lifecycle.scope.session_id,
             };
             // The request re-sends every image the session keeps, and
             // building it whole would hold all of them, encoded, at once.

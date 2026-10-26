@@ -2543,11 +2543,13 @@ tmuxTest(
       service_tier?: string;
       max_output_tokens?: number;
       reasoning?: { effort?: string };
+      prompt_cache_key?: string;
     };
     expect(directBody.model).toBe("gpt-5.6-sol");
     expect(directBody.service_tier).toBe("priority");
     expect(directBody.max_output_tokens).toBeUndefined();
     expect(directBody.reasoning?.effort).toBe("max");
+    expect(directBody.prompt_cache_key).toMatch(/^\S+$/);
     for (const request of [...gateway.requests, ...gateway.modelRequests]) {
       expect(request.headers.get("authorization")).not.toBe(
         `Bearer ${chatgptOauth.accessToken}`,
